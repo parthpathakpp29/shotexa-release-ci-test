@@ -98,8 +98,19 @@ jobs:
           cat release-evidence/npm-ci.log
           exit "$code"
 
-      - name: TypeScript
+      - name: Generate Next.js route types
         if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        id: typegen
+        run: |
+          set +e
+          npx next typegen > release-evidence/typegen.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/typegen.exit
+          cat release-evidence/typegen.log
+          exit "$code"
+
+      - name: TypeScript
+        if: ${{ !cancelled() && steps.typegen.outcome == 'success' }}
         id: typescript
         run: |
           set +e
