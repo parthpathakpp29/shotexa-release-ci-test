@@ -38,6 +38,7 @@ export async function analyseStitch(
   matcher: TemplateMatcher,
   opts: AnalyseOptions = {},
 ): Promise<StitchAnalysis> {
+  if (opts.signal?.aborted) throw new StitchError("CANCELLED");
   const cfg = resolveStitchConfig(opts.config);
   const timings: Record<string, number> = {};
   const t0 = performance.now();

@@ -2,20 +2,33 @@
 
 import * as Dialog from "@radix-ui/react-dialog";
 import { X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useRef, type ReactNode, type RefObject } from "react";
 import { cn } from "@/lib/cn";
 
 /**
  * Mobile bottom sheet (Radix Dialog: focus trap, Escape, scroll lock, aria wiring).
  * Used for the file tray and tool controls on small screens (architecture §20).
  */
-export function BottomSheet({ open, onOpenChange, title, children, footer, className }: { open: boolean; onOpenChange: (v: boolean) => void; title: string; children: ReactNode; footer?: ReactNode; className?: string }) {
+export function BottomSheet({ open, onOpenChange, title, children, footer, className, returnFocusRef, fallbackFocusRef }: { open: boolean; onOpenChange: (v: boolean) => void; title: string; children: ReactNode; footer?: ReactNode; className?: string; returnFocusRef?: RefObject<HTMLElement | null>; fallbackFocusRef?: RefObject<HTMLElement | null> }) {
+  const opener = useRef<HTMLElement | null>(null);
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
         <Dialog.Overlay className="fixed inset-0 z-40 bg-dark/30 backdrop-blur-[1px] data-[state=open]:animate-in" />
         <Dialog.Content
           aria-describedby={undefined}
+          onOpenAutoFocus={() => {
+            opener.current = document.activeElement instanceof HTMLElement && document.activeElement !== document.body ? document.activeElement : null;
+          }}
+          onCloseAutoFocus={(event) => {
+            // These sheets have external open buttons, so Radix has no Dialog.Trigger ref.
+            // A breakpoint change can remove/hide that opener; focus the workspace instead.
+            const target = [returnFocusRef?.current, opener.current, fallbackFocusRef?.current].find((element) => element?.isConnected && element.getClientRects().length && !element.closest('[inert], [aria-hidden="true"]'));
+            if (target) {
+              event.preventDefault();
+              target.focus({ preventScroll: true });
+            }
+          }}
           className={cn("fixed inset-x-0 bottom-0 z-50 flex max-h-[90dvh] flex-col rounded-t-xl border border-line bg-surface shadow-md outline-none", className)}
         >
           <div className="flex items-center justify-between border-b border-line px-4 py-2">

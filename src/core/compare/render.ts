@@ -64,6 +64,7 @@ export function compareIssue(canvas: Size, mode: CompareSettings["mode"], a: Siz
 }
 
 export async function renderCompare(imageA: Blob, imageB: Blob, settings: CompareSettings, o: CompareRenderOptions): Promise<CompareRenderResult> {
+  if (o.signal?.aborted) throw new EncodeError("ENCODE_CANCELLED");
   const started = performance.now();
   const layout = compareLayout(settings, { size: o.a, name: "" }, { size: o.b, name: "" }, o.alignment ?? null);
   const out = layout.canvas;
@@ -76,6 +77,7 @@ export async function renderCompare(imageA: Blob, imageB: Blob, settings: Compar
   let analysis: CompareVisualAnalysis | null = null;
   try {
     bitmapA = await decodeSource(imageA, o.a);
+    if (o.signal?.aborted) throw new EncodeError("ENCODE_CANCELLED");
     o.onProgress?.(0.25);
     bitmapB = await decodeSource(imageB, o.b);
     o.onProgress?.(0.5);
@@ -88,6 +90,7 @@ export async function renderCompare(imageA: Blob, imageB: Blob, settings: Compar
     blob = (await encodeCanvas(canvas, o.format, o.quality)) ?? (() => {
       throw new EncodeError("ENCODE_MEMORY_PRESSURE", "encoder returned null");
     })();
+    if (o.signal?.aborted) throw new EncodeError("ENCODE_CANCELLED");
   } catch (error) {
     if (error instanceof CompareError) throw error;
     throw toEncodeError(error);

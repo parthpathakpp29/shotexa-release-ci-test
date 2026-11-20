@@ -6,8 +6,8 @@ import { Button } from "@/components/ui/button";
 import { ContinueWith } from "@/components/workspace/continue-with";
 import { useWorkspaceContext } from "@/components/workspace/workspace-provider";
 import { continuationsFor } from "@/config/tools";
-import { openPdf, renderPdfPage } from "@/core/conversion/pdf-images";
-import { assertRasterSize, baseName, type RasterFormat } from "@/core/conversion/raster";
+import { PdfConversionTool } from "./pdf-conversion-tool";
+import { baseName, type RasterFormat } from "@/core/conversion/raster";
 import { convertSvg, sanitizeSvg } from "@/core/conversion/svg";
 import { downloadAsset, downloadBlob } from "@/core/runtime/runtime";
 
@@ -16,7 +16,11 @@ type Result = { id: string; name: string; width: number; height: number; error?:
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : "Conversion failed. Try another file."; }
 
-export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; initialFormat?: RasterFormat; testId?: string }) {
+export function ConversionTool(props: { tool: Kind; initialFormat?: RasterFormat; testId?: string }) {
+  return props.tool === "pdf-to-jpg" ? <PdfConversionTool initialFormat={props.initialFormat} testId={props.testId} /> : <SvgConversionTool {...props} />;
+}
+
+function SvgConversionTool({ tool, initialFormat, testId }: { tool: Kind; initialFormat?: RasterFormat; testId?: string }) {
   const { runtime } = useWorkspaceContext();
   const [format, setFormat] = useState<RasterFormat>(initialFormat ?? (tool === "svg-to-png" ? "png" : "jpg"));
   const [quality, setQuality] = useState(92);
@@ -24,14 +28,8 @@ export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; in
   const [progress, setProgress] = useState("");
   const [error, setError] = useState("");
   const [results, setResults] = useState<Result[]>([]);
-  const [pdfName, setPdfName] = useState("");
-  const pdfRef = useRef<Awaited<ReturnType<typeof openPdf>> | null>(null);
   const previewUrls = useRef<string[]>([]);
-  const generation = useRef(0);
-  const [pageCount, setPageCount] = useState(0);
-  const [selectedPages, setSelectedPages] = useState<number[]>([]);
-  const [pagePreviews, setPagePreviews] = useState<Record<number, string>>({});
-  const [scale, setScale] = useState(1.5);
+  const svgSelection = useRef(0);
   const [svg, setSvg] = useState("");
   const [svgName, setSvgName] = useState("");
   const [svgPreview, setSvgPreview] = useState("");
@@ -42,12 +40,10 @@ export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; in
   const [background, setBackground] = useState("#ffffff");
 
   useEffect(() => () => {
-    generation.current++;
+    svgSelection.current++;
     previewUrls.current.forEach(URL.revokeObjectURL);
-    void pdfRef.current?.destroy();
   }, []);
 
-  const clearPreviews = () => { previewUrls.current.forEach(URL.revokeObjectURL); previewUrls.current = []; setPagePreviews({}); };
   const clearSvgPreview = () => {
     previewUrls.current.forEach(URL.revokeObjectURL);
     previewUrls.current = [];
@@ -60,49 +56,24 @@ export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; in
 
   async function chooseFiles(files: FileList | null) {
     if (!files?.length || busy) return;
+    const selection = ++svgSelection.current;
     setError(""); setResults([]); setProgress("");
     const file = files[0];
-    if (tool === "svg-to-png") {
-      clearSvgPreview();
-      setSvg(""); setSvgName("");
-      if (file.size > 2_000_000) { setError("Choose an SVG under 2 MB."); return; }
-      try {
-        const parsed = sanitizeSvg(await file.text());
-        const url = URL.createObjectURL(new Blob([parsed.svg], { type: "image/svg+xml" }));
-        previewUrls.current.push(url);
-        setSvgPreview(url); setSvg(parsed.svg); setSvgName(file.name);
-        setOriginalSize({ width: parsed.width, height: parsed.height });
-        setWidth(Math.round(parsed.width)); setHeight(Math.round(parsed.height));
-      } catch (e) { setSvg(""); setSvgName(""); setError(errorText(e)); }
-      return;
-    }
-    setBusy(true); setPdfName(""); setPageCount(0); setSelectedPages([]); clearPreviews();
-    const thisGeneration = ++generation.current;
+    clearSvgPreview();
+    setSvg(""); setSvgName("");
+    if (file.size > 2_000_000) { setError("Choose an SVG under 2 MB."); return; }
     try {
-      await pdfRef.current?.destroy(); pdfRef.current = null;
-      setProgress("Opening PDF…");
-      const doc = await openPdf(file);
-      if (generation.current !== thisGeneration) { await doc.destroy(); return; }
-      pdfRef.current = doc; setPdfName(file.name); setPageCount(doc.numPages);
-      setSelectedPages(Array.from({ length: doc.numPages }, (_, i) => i + 1));
-      for (let n = 1; n <= doc.numPages; n++) {
-        if (generation.current !== thisGeneration) break;
-        setProgress(`Preparing page previews ${n} of ${doc.numPages}…`);
-        try {
-          const page = await doc.getPage(n);
-          const size = page.getViewport({ scale: 1 });
-          page.cleanup();
-          const previewScale = Math.min(0.22, 240 / Math.max(size.width, size.height));
-          const preview = await renderPdfPage(doc, n, previewScale, "png");
-          const url = URL.createObjectURL(preview.blob);
-          previewUrls.current.push(url);
-          setPagePreviews((current) => ({ ...current, [n]: url }));
-        } catch { /* The page can still be selected and exported at a safer scale. */ }
-        await new Promise((resolve) => setTimeout(resolve, 0));
-      }
-      setProgress("");
-    } catch (e) { setError(errorText(e)); setProgress(""); }
-    finally { setBusy(false); }
+      const text = await file.text();
+      if (selection !== svgSelection.current) return;
+      const parsed = sanitizeSvg(text);
+      const url = URL.createObjectURL(new Blob([parsed.svg], { type: "image/svg+xml" }));
+      previewUrls.current.push(url);
+      setSvgPreview(url); setSvg(parsed.svg); setSvgName(file.name);
+      setOriginalSize({ width: parsed.width, height: parsed.height });
+      setWidth(Math.round(parsed.width)); setHeight(Math.round(parsed.height));
+    } catch (e) {
+      if (selection === svgSelection.current) setError(errorText(e));
+    }
   }
 
   async function convert() {
@@ -110,34 +81,11 @@ export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; in
     setBusy(true); setError(""); setResults([]);
     const output: Result[] = [];
     try {
-      if (tool === "pdf-to-jpg") {
-        const doc = pdfRef.current;
-        if (!doc || !selectedPages.length) throw new Error("Select at least one PDF page.");
-        let totalPixels = 0;
-        for (const n of selectedPages) {
-          const page = await doc.getPage(n);
-          const viewport = page.getViewport({ scale });
-          assertRasterSize(Math.ceil(viewport.width), Math.ceil(viewport.height));
-          totalPixels += Math.ceil(viewport.width) * Math.ceil(viewport.height);
-          page.cleanup();
-          if (totalPixels > 80_000_000) throw new Error("This selection exceeds the safe batch size. Select fewer pages or a lower resolution.");
-        }
-        for (let i = 0; i < selectedPages.length; i++) {
-          const n = selectedPages[i]; setProgress(`Rendering page ${n} (${i + 1} of ${selectedPages.length})…`);
-          try {
-            const converted = await renderPdfPage(doc, n, scale, format, quality / 100);
-            output.push(addResult(converted.blob, `${baseName(pdfName)}-page-${String(n).padStart(2, "0")}.${format}`, converted.width, converted.height));
-          } catch (e) { output.push({ name: `Page ${n}`, error: errorText(e) }); }
-          setResults([...output]);
-          await new Promise((resolve) => setTimeout(resolve, 0));
-        }
-      } else {
-        if (!svg) throw new Error("Choose an SVG first.");
-        setProgress("Rasterizing SVG…");
-        const blob = await convertSvg(svg, width, height, format, background, quality / 100);
-        output.push(addResult(blob, `${baseName(svgName)}.${format}`, width, height));
-        setResults([...output]);
-      }
+      if (!svg) throw new Error("Choose an SVG first.");
+      setProgress("Rasterizing SVG…");
+      const blob = await convertSvg(svg, width, height, format, background, quality / 100);
+      output.push(addResult(blob, `${baseName(svgName)}.${format}`, width, height));
+      setResults([...output]);
       if (output.every((item) => item.error)) setError("No images were converted. See the file errors below.");
     } catch (e) { setError(errorText(e)); }
     finally { setProgress(""); setBusy(false); }
@@ -160,8 +108,8 @@ export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; in
 
   const success = results.filter((item) => !!item.id);
   const accept = tool === "pdf-to-jpg" ? ".pdf,application/pdf" : ".svg,image/svg+xml";
-  const ready = tool === "pdf-to-jpg" ? pageCount > 0 && selectedPages.length > 0 : !!svg;
-  const chosen = tool === "pdf-to-jpg" ? pdfName || "No PDF selected" : svgName || "No SVG selected";
+  const ready = !!svg;
+  const chosen = svgName || "No SVG selected";
   return <div className="rounded-2xl border border-line bg-surface p-5 shadow-sm sm:p-6" data-testid={`${testId ?? tool}-converter`}>
     <label className="block cursor-pointer rounded-xl border border-dashed border-line-strong bg-surface-3/60 p-5 text-center hover:border-accent focus-within:border-accent focus-within:ring-2 focus-within:ring-accent/30">
       <span className="block text-base font-semibold text-ink">{tool === "pdf-to-jpg" ? "Choose a PDF" : "Choose an SVG"}</span>
@@ -169,13 +117,6 @@ export function ConversionTool({ tool, initialFormat, testId }: { tool: Kind; in
       <input type="file" accept={accept} disabled={busy} aria-label={tool === "pdf-to-jpg" ? "PDF file" : "SVG file"} onChange={(event) => { void chooseFiles(event.target.files); event.target.value = ""; }} className="sr-only" />
       <span className="mt-4 flex items-center justify-center gap-3 text-sm"><span className="rounded-md bg-accent px-4 py-2 font-semibold text-white">Choose file</span><span className="max-w-48 truncate text-ink-2" title={chosen}>{chosen}</span></span>
     </label>
-    {tool === "pdf-to-jpg" && pageCount > 0 && <>
-      <div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="font-semibold">{pdfName} · {pageCount} pages</p><div className="flex gap-2"><Button size="sm" variant="secondary" onClick={() => setSelectedPages(Array.from({ length: pageCount }, (_, i) => i + 1))}>Select all</Button><Button size="sm" variant="secondary" onClick={() => setSelectedPages([])}>Clear</Button></div></div>
-      <div className="mt-3 grid max-h-80 grid-cols-3 gap-2 overflow-y-auto sm:grid-cols-4" aria-label="PDF pages">
-        {Array.from({ length: pageCount }, (_, i) => i + 1).map((n) => <label key={n} className="cursor-pointer rounded-md border border-line p-2 text-center text-sm hover:border-accent"><input type="checkbox" checked={selectedPages.includes(n)} onChange={() => setSelectedPages((pages) => pages.includes(n) ? pages.filter((p) => p !== n) : [...pages, n].sort((a,b) => a-b))} aria-label={`Page ${n}`} className="mr-1" /><span>Page {n}</span>{pagePreviews[n] && <img src={pagePreviews[n]} alt={`Preview of PDF page ${n}`} className="mt-2 h-24 w-full object-contain" />}</label>)}
-      </div>
-      <label className="mt-4 block text-sm font-medium">Resolution <select value={scale} onChange={(e) => setScale(Number(e.target.value))} className="ml-2 rounded-md border border-line bg-surface px-3 py-2"><option value={1}>Standard · 1×</option><option value={1.5}>Sharp · 1.5×</option><option value={2}>High · 2×</option><option value={3}>Very high · 3×</option></select></label>
-    </>}
     {tool === "svg-to-png" && svg && <>
       <div className="mt-4 flex min-h-40 items-center justify-center rounded-lg border border-line bg-[linear-gradient(45deg,#eee_25%,transparent_25%),linear-gradient(-45deg,#eee_25%,transparent_25%),linear-gradient(45deg,transparent_75%,#eee_75%),linear-gradient(-45deg,transparent_75%,#eee_75%)] bg-[length:20px_20px]">{svgPreview && <img src={svgPreview} alt="Sanitized SVG preview" className="max-h-48 max-w-full object-contain" />}</div>
       <p className="t-body-sm mt-2 text-ink-2">{svgName} · source {originalSize.width} × {originalSize.height}</p>

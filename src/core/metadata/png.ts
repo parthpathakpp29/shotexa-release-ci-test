@@ -8,7 +8,7 @@
  */
 import { ascii, checkRange, concat, crc32, fourcc, METADATA_LIMITS, safeText, startsWith, u32be, writeU32be } from "./bytes";
 import { malformed, MetadataError } from "./errors";
-import { minimalOrientationTiff, readExif } from "./exif";
+import { isMinimalOrientationTiff, minimalOrientationTiff, readExif } from "./exif";
 import { item, type ClassifiedElement, type FormatAnalysis } from "./policy";
 import type { MetadataCategory, MetadataPolicy, MetadataWarning, PrivacyFinding } from "./types";
 import { scanXmp } from "./xmp";
@@ -132,7 +132,7 @@ export function analysePng(b: Uint8Array, policy: MetadataPolicy): FormatAnalysi
       exifSeen++;
       const r = readExif(data, "PNG eXIf");
       if (r.malformed) warnings.push({ code: "MALFORMED_METADATA_BLOCK", message: "eXIf block is malformed (removed)" });
-      const onlyOrientation = !r.malformed && r.tagCount === 1 && r.orientation !== undefined && !r.thumbnail;
+      const onlyOrientation = isMinimalOrientationTiff(data, r.orientation);
       if (exifSeen === 1 && r.orientation !== undefined) orientation = r.orientation;
       const findings: PrivacyFinding[] = onlyOrientation ? [] : [{ category: "exif", label: `EXIF block (${size} bytes)`, source: "PNG eXIf" }, ...r.findings];
       if (!onlyOrientation && r.orientation !== undefined) findings.push({ category: "orientation", label: "Orientation", source: "PNG eXIf", value: String(r.orientation) });

@@ -8,7 +8,7 @@
  */
 import { checkRange, concat, METADATA_LIMITS, safeText, startsWith, u16be, writeU16be, ascii } from "./bytes";
 import { malformed } from "./errors";
-import { minimalOrientationTiff, readExif } from "./exif";
+import { isMinimalOrientationTiff, minimalOrientationTiff, readExif } from "./exif";
 import { item, type ClassifiedElement, type FormatAnalysis } from "./policy";
 import type { MetadataPolicy, MetadataWarning, PrivacyFinding } from "./types";
 import { scanPhotoshopIrb, scanXmp, XMP_EXT_SIG, XMP_SIG } from "./xmp";
@@ -112,9 +112,10 @@ export function analyseJpeg(b: Uint8Array, policy: MetadataPolicy): FormatAnalys
       }
       if (m === 0xe1 && startsWith(data, 0, "Exif\0\0")) {
         exifCount++;
-        const r = readExif(data.subarray(6), "EXIF");
+        const tiff = data.subarray(6);
+        const r = readExif(tiff, "EXIF");
         if (r.malformed) warnings.push({ code: "MALFORMED_METADATA_BLOCK", message: "EXIF block is malformed (removed)" });
-        const onlyOrientation = !r.malformed && r.tagCount === 1 && r.orientation !== undefined && !r.thumbnail;
+        const onlyOrientation = isMinimalOrientationTiff(tiff, r.orientation);
         if (exifCount === 1 && r.orientation !== undefined) orientation = r.orientation;
         const findings: PrivacyFinding[] = onlyOrientation ? [] : [{ category: "exif", label: `EXIF block (${size} bytes)`, source: "APP1" }, ...r.findings];
         if (!onlyOrientation && r.orientation !== undefined) findings.push({ category: "orientation", label: "Orientation", source: "EXIF IFD0", value: String(r.orientation) });
@@ -123,8 +124,7 @@ export function analyseJpeg(b: Uint8Array, policy: MetadataPolicy): FormatAnalys
           add(s, { item: item(`${app} Exif`, "orientation", "Orientation-only EXIF", size, "preserve", "keeps correct display orientation; no private data", false), findings: [] });
         } else if (keep && !minimalInserted) {
           minimalInserted = true;
-          const tiff = minimalOrientationTiff(r.orientation!);
-          const payloadBytes = concat([ascii("Exif\0\0"), tiff]);
+          const payloadBytes = concat([ascii("Exif\0\0"), minimalOrientationTiff(r.orientation!)]);
           add(s, { item: item(`${app} Exif`, "exif", "EXIF (reduced to Orientation only)", size, "rewrite", "private tags/thumbnail removed; orientation kept so the image doesn't rotate", true), findings, replacement: concat([new Uint8Array([0xff, 0xe1]), writeU16be(payloadBytes.length + 2), payloadBytes]) });
           warnings.push({ code: "ORIENTATION_KEPT", message: `EXIF orientation ${r.orientation} kept (minimal EXIF)` });
         } else {

@@ -122,7 +122,7 @@ describe("preview decoding while the page is being left", () => {
     const { broker: b, run } = broker(() => new Promise((_, reject) => { failWorker = reject; }));
     const rt = createWorkspaceRuntime({ broker: b, caps: CAPS, pageEvents: page });
     const ingest = rt.ingest([png()], "picker");
-    await vi.waitFor(() => expect(run).toHaveBeenCalledWith("image", "image.preview", expect.anything())); // decode in flight
+    await vi.waitFor(() => expect(run).toHaveBeenCalledWith("image", "image.preview", expect.anything(), expect.objectContaining({ signal: expect.any(AbortSignal) }))); // decode in flight
     page.dispatchEvent(new Event("pagehide")); // navigation starts…
     failWorker(Object.assign(new Error("worker gone"), { code: "WORKER_CRASHED" })); // …and tears the worker down
     const { added } = await ingest; // settles without an error
@@ -172,17 +172,19 @@ describe("preview decoding while the page is being left", () => {
     const { added } = await rt.ingest([png()], "picker");
     expect(pageDecode).not.toHaveBeenCalled();
     expect(rt.store.getState().files[added[0]].previewVersion).toBe(0);
-    expect(rt.store.getState().jobs[`preview:${added[0]}`]).toMatchObject({ status: "failed" });
+    expect(rt.store.getState().jobs[`preview:${added[0]}`]).toMatchObject({ status: code === "CANCELLED" ? "cancelled" : "failed" });
     rt.dispose();
   });
 
   it("still falls back to a page decode when the worker fails while the page stays open", async () => {
+    pageDecode.mockResolvedValue({ width: 1024, height: 2216, close: vi.fn() } as unknown as ImageBitmap);
     const page = new EventTarget();
     const { broker: b } = broker(async () => { throw Object.assign(new Error("no worker decode"), { code: "UNSUPPORTED" }); });
     const rt = createWorkspaceRuntime({ broker: b, caps: CAPS, pageEvents: page });
     const { added } = await rt.ingest([png()], "picker");
-    expect(pageDecode).toHaveBeenCalledTimes(2); // full display orientation, then bounded preview
-    expect(rt.store.getState().files[added[0]]).toMatchObject({ width: 10, height: 20 });
+    expect(pageDecode).toHaveBeenCalledTimes(1); // bounded decode directly from the original Blob
+    expect(pageDecode).toHaveBeenCalledWith(expect.any(Blob), expect.objectContaining({ resizeWidth: 1024, resizeHeight: 2216 }));
+    expect(rt.store.getState().files[added[0]]).toMatchObject({ width: 1170, height: 2532 });
     expect(rt.store.getState().files[added[0]].previewVersion).toBeGreaterThan(0);
     rt.dispose();
   });
@@ -247,10 +249,11 @@ describe("preview decoding while the page is being left", () => {
     release({ bitmap: fakeBitmap() }); // it finishes quietly…
     const { added } = await ingest;
     expect(run).toHaveBeenCalledTimes(1); // …and the second one never starts
-    expect(rt.store.getState().files[added[0]].previewVersion).toBeGreaterThan(0);
+    expect(rt.store.getState().files[added[0]].previewVersion).toBe(0); // cancelled late output is not applied
     expect(rt.store.getState().files[added[1]].previewVersion).toBe(0);
     page.dispatchEvent(new Event("pointerdown")); // the navigation did not happen
     await vi.waitFor(() => expect(rt.store.getState().files[added[1]].previewVersion).toBeGreaterThan(0));
+    await vi.waitFor(() => expect(rt.store.getState().files[added[0]].previewVersion).toBeGreaterThan(0));
     expect(pageDecode).not.toHaveBeenCalled();
     rt.dispose();
   });

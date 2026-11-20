@@ -22,7 +22,11 @@ export type PreprocessStep = "gray" | "contrast" | "binarize" | "invert" | "shar
 export function toGray(img: Rgba): Gray {
   const out = new Uint8Array(img.width * img.height);
   const d = img.data;
-  for (let i = 0, p = 0; i < out.length; i++, p += 4) out[i] = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+  for (let i = 0, p = 0; i < out.length; i++, p += 4) {
+    const gray = (d[p] * 77 + d[p + 1] * 150 + d[p + 2] * 29) >> 8;
+    // OCR sees a white paper background, including PNG pixels whose hidden RGB is black.
+    out[i] = Math.round((gray * d[p + 3] + 255 * (255 - d[p + 3])) / 255);
+  }
   return { width: img.width, height: img.height, data: out };
 }
 

@@ -67,6 +67,11 @@ export function allLines(blocks: OcrBlock[]): OcrLine[] {
   return blocks.flatMap((b) => b.paragraphs.flatMap((p) => p.lines));
 }
 
+/** Recognized text with usable original-image geometry, rather than manually edited prose. */
+export function hasOcrText(result: OcrResult | undefined): boolean {
+  return !!result && allLines(result.blocks).some((line) => line.text.trim().length > 0 && [line.bbox.x, line.bbox.y, line.bbox.w, line.bbox.h].every(Number.isFinite) && line.bbox.w > 0 && line.bbox.h > 0);
+}
+
 /**
  * Reading order.
  * - "engine": Tesseract's block/paragraph order (column-aware, but can separate chat

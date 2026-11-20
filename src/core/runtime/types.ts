@@ -120,6 +120,10 @@ export interface StitchPair {
   /** False when no reliable overlap was found (placed end to end). */
   matched: boolean;
   bands: { top: number; bottom: number };
+  /** Heuristic evidence for the automatic join, not a probability or manual verification. */
+  matchScore?: number;
+  matchNotes?: string[];
+  matchReason?: string;
   error?: string;
 }
 

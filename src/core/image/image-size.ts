@@ -49,11 +49,30 @@ export function parseImageSize(b: Uint8Array): ImageSize | null {
   return null;
 }
 
-/** Reads only as many bytes as needed (JPEG headers can hold large EXIF blocks). */
-export async function readImageSize(blob: Blob): Promise<ImageSize | null> {
-  for (const n of [64 * 1024, 1024 * 1024, blob.size]) {
-    const r = parseImageSize(new Uint8Array(await blob.slice(0, n).arrayBuffer()));
-    if (r || n >= blob.size) return r;
+/** Bounded header reads. Skip JPEG metadata by marker lengths rather than copying the file. */
+export async function readImageSize(blob: Blob, signal?: { readonly aborted: boolean }): Promise<ImageSize | null> {
+  if (signal?.aborted) return null;
+  const head = new Uint8Array(await blob.slice(0, 64 * 1024).arrayBuffer());
+  if (signal?.aborted) return null;
+  const found = parseImageSize(head);
+  if (found || head.length >= blob.size) return found;
+  if (head[0] !== 255 || head[1] !== 216) return null; // PNG/WebP dimensions belong at the start.
+  let offset = 2;
+  for (let markers = 0; markers < 4096 && offset + 9 < blob.size; markers++) {
+    if (signal?.aborted) return null;
+    const bytes = new Uint8Array(await blob.slice(offset, offset + 10).arrayBuffer());
+    if (signal?.aborted) return null;
+    if (bytes.length < 10 || bytes[0] !== 255) return null;
+    const marker = bytes[1];
+    if (marker === 255) { offset++; continue; }
+    if (marker === 0xda || marker === 0xd9) return null;
+    if (marker === 1 || (marker >= 0xd0 && marker <= 0xd8)) { offset += 2; continue; }
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const length = view.getUint16(2);
+    if (length < 2 || offset + 2 + length > blob.size) return null;
+    const sof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+    if (sof) return length >= 8 ? { format: "jpeg", width: view.getUint16(7), height: view.getUint16(5) } : null;
+    offset += 2 + length;
   }
   return null;
 }

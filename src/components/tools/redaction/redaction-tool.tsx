@@ -12,6 +12,7 @@ import { WorkspaceShell } from "@/components/workspace/workspace-shell";
 import { continuationsFor, TOOLS } from "@/config/tools";
 import { downloadAsset } from "@/core/runtime/runtime";
 import type { RedactionMode, SafeShareVerification } from "@/core/redaction/types";
+import { isSafeShareVerified } from "@/core/redaction/verification";
 import { detectSensitiveText, findingsToRegions } from "@/core/privacy/detectors";
 import { parseCustomRules, PRIVACY_RULES_STORAGE_KEY, saveCustomRules } from "@/core/privacy/custom-rules";
 import { DEFAULT_PRIVACY_SCAN } from "@/core/privacy/presets";
@@ -38,9 +39,11 @@ function RedactionWorkspace({ tool, defaultMode }: { tool: "safe-share" | "blur"
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ id: string; sourceId: string; verification: SafeShareVerification; regionCount: number } | null>(null);
   const [reviewed, setReviewed] = useState(false);
-  const [reviewing, setReviewing] = useState(false);
+  const [textCheckStatus, setTextCheckStatus] = useState<"not-requested" | "checking" | "clear" | "warning" | "unavailable">("not-requested");
+  const reviewing = textCheckStatus === "checking";
   const [viewingResult, setViewingResult] = useState(false);
   const pendingResult = useRef<string | null>(null);
+  const reviewGeneration = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [config, setConfigState] = useState<PrivacyScanConfig>(() => ({ ...DEFAULT_PRIVACY_SCAN, enabledCategories: [...DEFAULT_PRIVACY_SCAN.enabledCategories], customRules: typeof window === "undefined" ? [] : parseCustomRules(window.localStorage.getItem(PRIVACY_RULES_STORAGE_KEY)) }));
   const [scanResult, setScanResult] = useState<PrivacyScanResult | null>(() => selectedId ? runtime.privacyScans.forAsset(selectedId) ?? null : null);
@@ -53,7 +56,11 @@ function RedactionWorkspace({ tool, defaultMode }: { tool: "safe-share" | "blur"
   const activeScanResult = scanResult?.assetId === selectedId ? scanResult : selectedId ? runtime.privacyScans.forAsset(selectedId) ?? null : null;
 
   useEffect(() => setMode(defaultMode), [defaultMode, setMode]);
-  useEffect(() => () => { if (pendingResult.current) runtime.discardPreparedSafeShare(pendingResult.current); }, [runtime]);
+  useEffect(() => () => {
+    reviewGeneration.current++;
+    if (pendingResult.current) runtime.discardPreparedSafeShare(pendingResult.current);
+    pendingResult.current = null;
+  }, [runtime]);
 
   function setConfig(next: PrivacyScanConfig) {
     setConfigState(next);
@@ -92,58 +99,96 @@ function RedactionWorkspace({ tool, defaultMode }: { tool: "safe-share" | "blur"
     if (!selectedId || !operations.length || busy) return;
     const sourceId = selectedId;
     const regionCount = operations.length;
+    const generation = ++reviewGeneration.current;
+    const sourceSubtypes = appliedSubtypes[sourceId] ?? [];
+    const scanConfig = structuredClone(config);
     setBusy(true);
     setError(null);
+    setResult(null);
+    setReviewed(false);
+    setViewingResult(false);
+    setTextCheckStatus("not-requested");
     setVerificationWarning(null);
     try {
       if (pendingResult.current) runtime.discardPreparedSafeShare(pendingResult.current);
       pendingResult.current = null;
       const exported = await runtime.prepareSafeShare(selectedId);
+      if (generation !== reviewGeneration.current || runtime.store.getState().selectedId !== sourceId) {
+        runtime.discardPreparedSafeShare(exported.id);
+        return;
+      }
+      if (!isSafeShareVerified(exported.verification)) {
+        runtime.discardPreparedSafeShare(exported.id);
+        throw new Error("REDACTION_VERIFY_FAILED");
+      }
       pendingResult.current = exported.id;
       setResult({ id: exported.id, sourceId, verification: exported.verification, regionCount });
-      setReviewed(false);
       setViewingResult(true);
+      if (sourceSubtypes.length) {
+        setTextCheckStatus("checking");
+        let warning: string | null = null;
+        let status: "clear" | "warning" | "unavailable" = "clear";
+        try {
+          const verifiedOcr = await runtime.extractPreparedSafeShareText(exported.id);
+          const residual = detectSensitiveText(verifiedOcr, scanConfig).filter((finding) => sourceSubtypes.includes(finding.subtype) && finding.confidence !== "low");
+          if (residual.length) {
+            status = "warning";
+            warning = "Sensitive text may still be visible. Inspect the output and this warning before confirming review.";
+          }
+        } catch {
+          status = "unavailable";
+          warning = "The optional text check could not run. No text-check result is available; inspect the final image before confirming review.";
+        }
+        if (generation !== reviewGeneration.current || pendingResult.current !== exported.id) return;
+        if (runtime.store.getState().selectedId !== sourceId) {
+          runtime.discardPreparedSafeShare(exported.id);
+          pendingResult.current = null;
+          setResult(null);
+          setTextCheckStatus("not-requested");
+          return;
+        }
+        setVerificationWarning(warning);
+        setTextCheckStatus(status);
+      }
     } catch (e) {
+      if (generation !== reviewGeneration.current) return;
       setError((e as { code?: string }).code === "REDACTION_MEMORY_PRESSURE" ? "This image is too large for a safe export on this device. Try a smaller image or PNG output." : "Safe Share could not export this image. Your original is unchanged.");
     } finally {
-      setBusy(false);
+      if (generation === reviewGeneration.current) setBusy(false);
     }
   }
 
-  async function confirmReview() {
-    if (!result || reviewed || reviewing) return;
-    setReviewing(true);
+  function confirmReview() {
+    if (!result || reviewed || reviewing || busy || pendingResult.current !== result.id || !isSafeShareVerified(result.verification)) return;
     try {
       runtime.publishPreparedSafeShare(result.id);
       pendingResult.current = null;
       setReviewed(true);
-      const sourceSubtypes = appliedSubtypes[result.sourceId] ?? [];
-      if (sourceSubtypes.length) {
-        try {
-          const verifiedOcr = await runtime.extractText(result.id, undefined, true);
-          const residual = detectSensitiveText(verifiedOcr.result, config).filter((finding) => sourceSubtypes.includes(finding.subtype) && finding.confidence !== "low");
-          setVerificationWarning(residual.length ? "Sensitive text may still be visible. Review the flattened output before sharing." : null);
-        } catch {
-          setVerificationWarning("The pixels and metadata were verified, but the optional post-export text check could not run. Review before sharing.");
-        }
-      }
     } catch {
-      setError("The prepared image is no longer available. Prepare a new safe copy and review it again.");
-    } finally {
-      setReviewing(false);
+      runtime.discardPreparedSafeShare(result.id);
+      pendingResult.current = null;
+      setResult(null);
+      setViewingResult(false);
+      setTextCheckStatus("not-requested");
+      setError("The prepared image could not be verified. Prepare a new safe copy and review it again.");
     }
   }
 
   function adjustRegions() {
     if (!result) return;
+    reviewGeneration.current++;
     if (pendingResult.current) runtime.discardPreparedSafeShare(pendingResult.current);
     pendingResult.current = null;
+    setReviewed(false);
+    setTextCheckStatus("not-requested");
+    setVerificationWarning(null);
+    setBusy(false);
     setViewingResult(false);
     selectFile(result.sourceId);
   }
 
   async function copyPng() {
-    if (!result || !reviewed || reviewing) return;
+    if (!result || !reviewed || reviewing || !isSafeShareVerified(result.verification)) return;
     const blob = runtime.registry.blob(result.id);
     if (!blob || blob.type !== "image/png" || !navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
       toast({ type: "error", message: "Copy PNG is not supported for this output. Download remains available." }); return;
@@ -155,13 +200,15 @@ function RedactionWorkspace({ tool, defaultMode }: { tool: "safe-share" | "blur"
   if (!selectedId || !file) return null;
   const showingResult = Boolean(result && viewingResult && (selectedId === result.id || (!reviewed && selectedId === result.sourceId)));
   const verification = showingResult ? result?.verification ?? null : null;
+  const outputVerified = isSafeShareVerified(verification);
+  const canDownload = reviewed && !reviewing && outputVerified;
   return (
     <WorkspaceShell
       tool={tool}
-      status={<Badge tone={showingResult ? "success" : operations.length || activeScanResult?.findings.length ? "accent" : "neutral"} dot>{showingResult ? "Review safe copy" : operations.length ? `${operations.length} region${operations.length === 1 ? "" : "s"} selected` : activeScanResult?.findings.length ? `${activeScanResult.findings.length} findings to review` : "Ready to redact"}</Badge>}
+      status={<Badge tone={canDownload ? "success" : showingResult || operations.length || activeScanResult?.findings.length ? "accent" : "neutral"} dot>{showingResult ? reviewing ? "Checking copy" : canDownload ? "Copy reviewed" : "Review safe copy" : operations.length ? `${operations.length} region${operations.length === 1 ? "" : "s"} selected` : activeScanResult?.findings.length ? `${activeScanResult.findings.length} findings to review` : "Ready to redact"}</Badge>}
       fileHint="Select a screenshot or a previous Shotexa result. Redactions stay editable until export."
       inspectorTitle="Safe Share controls"
-      exportAction={{ label: showingResult ? "Download Reviewed Copy" : "Prepare Safe Copy", onClick: showingResult && result ? () => downloadAsset(runtime, result.id) : exportSafeCopy, disabled: showingResult ? !reviewed || reviewing : !operations.length, busy }}
+      exportAction={{ label: showingResult ? "Download Reviewed Copy" : "Prepare Safe Copy", onClick: showingResult && result ? () => { if (canDownload) downloadAsset(runtime, result.id); } : exportSafeCopy, disabled: showingResult ? !canDownload : !operations.length, busy }}
       canvas={
         <>
           <h1 className="sr-only">{TOOLS[tool].seo.h1}</h1>
@@ -170,7 +217,9 @@ function RedactionWorkspace({ tool, defaultMode }: { tool: "safe-share" | "blur"
             <Image unoptimized src={runtime.registry.objectUrl(result.id) ?? ""} alt="Final flattened and metadata-cleaned result" width={file.width} height={file.height} className="mx-auto max-h-[70dvh] max-w-full object-contain" />
             <p className="mt-3 text-center text-sm text-ink-2">Inspect every corner before sharing. Automatic detection can miss sensitive details.</p>
             <details className="mx-auto mt-3 max-w-3xl rounded-md border border-line p-3"><summary className="cursor-pointer text-sm font-medium">Compare before and after</summary><div className="mt-3 grid gap-3 md:grid-cols-2"><div><p className="mb-1 text-xs text-ink-3">Original</p>{runtime.registry.objectUrl(result.sourceId) ? <Image unoptimized src={runtime.registry.objectUrl(result.sourceId)!} alt="Original image before redaction" width={file.width} height={file.height} className="w-full rounded border border-line object-contain" /> : <p className="text-sm text-ink-3">Original no longer in workspace.</p>}</div><div><p className="mb-1 text-xs text-ink-3">Sanitized</p><Image unoptimized src={runtime.registry.objectUrl(result.id) ?? ""} alt="Sanitized image after redaction" width={file.width} height={file.height} className="w-full rounded border border-line object-contain" /></div></div></details>
-            <label className="mx-auto mt-4 flex min-h-11 max-w-xl items-start gap-3 rounded-md border border-line p-3 text-sm"><input type="checkbox" className="mt-1 size-4" checked={reviewed} disabled={reviewed || reviewing} onChange={(event) => { if (event.target.checked) void confirmReview(); }} /> {reviewing ? "Checking the reviewed image…" : "I inspected the final image and it is safe to share"}</label>
+            <p role="status" className="mx-auto mt-3 max-w-xl text-sm text-ink-2" data-testid="safe-share-text-check">{reviewing ? "Checking the prepared image for matching sensitive text…" : textCheckStatus === "clear" ? "The optional text check found no matching sensitive text. It can still miss details." : textCheckStatus === "not-requested" ? "Optional text check not requested. Review the image manually." : "Consider the text-check warning before confirming review."}</p>
+            {verificationWarning && <div role="alert" className="mx-auto mt-3 max-w-xl rounded-md border border-[#f0dcb4] bg-warning-soft px-4 py-3 text-sm text-warning">{verificationWarning}</div>}
+            <label className="mx-auto mt-4 flex min-h-11 max-w-xl items-start gap-3 rounded-md border border-line p-3 text-sm"><input type="checkbox" className="mt-1 size-4" checked={reviewed} disabled={reviewed || reviewing || busy || !outputVerified} onChange={(event) => { if (event.target.checked) confirmReview(); }} /> I inspected the final image and it is safe to share{verificationWarning ? ", taking the text-check warning into account" : ""}</label>
           </section> : <RedactionCanvas assetId={selectedId} findings={activeScanResult?.findings ?? []} currentFindingId={currentFindingId} onSelectFinding={setCurrentFindingId} />}
         </>
       }
@@ -178,14 +227,13 @@ function RedactionWorkspace({ tool, defaultMode }: { tool: "safe-share" | "blur"
       below={
         showingResult && result && (
           <div data-testid="safe-share-result">
-            <div className="mt-5 flex items-center gap-3 rounded-lg border border-[#cfe5d6] bg-success-soft p-4 text-success">
+            {outputVerified ? <div className="mt-5 flex items-center gap-3 rounded-lg border border-[#cfe5d6] bg-success-soft p-4 text-success">
               <ShieldCheck className="size-5" />
               <div><p className="text-sm font-medium">Flattened copy prepared. Review it before downloading or continuing.</p><p className="mt-1 text-xs">{result.regionCount} selected region{result.regionCount === 1 ? "" : "s"} flattened · metadata removed · export generated · redaction layers are no longer editable</p></div>
-            </div>
-            {verificationWarning && <div role="alert" className="mt-3 rounded-md border border-[#f0dcb4] bg-warning-soft px-4 py-3 text-sm text-warning">{verificationWarning}</div>}
-            <div className="mt-3 flex flex-wrap gap-2 text-xs text-success"><span className="rounded-full border border-line px-3 py-1">Redactions flattened</span><span className="rounded-full border border-line px-3 py-1">Privacy metadata removed</span><span className="rounded-full border border-line px-3 py-1">Output verified</span></div>
-            {reviewed && !reviewing && <div className="mt-3 flex flex-wrap gap-2"><Button variant="primary" onClick={() => downloadAsset(runtime, result.id)}><Download /> Download reviewed copy</Button>{runtime.store.getState().files[result.id]?.type === "image/png" && <Button variant="secondary" onClick={() => void copyPng()} data-testid="safe-share-copy-png"><Copy /> Copy PNG</Button>}</div>}
-            {reviewed && !reviewing && <ContinueWith tools={continuationsFor(tool)} fileId={result.id} />}
+            </div> : <p role="alert" className="mt-3 text-sm text-error">This output has not passed verification. Prepare a new copy before continuing.</p>}
+            {outputVerified && <div className="mt-3 flex flex-wrap gap-2 text-xs text-success"><span className="rounded-full border border-line px-3 py-1">Redactions flattened</span><span className="rounded-full border border-line px-3 py-1">Privacy metadata removed</span><span className="rounded-full border border-line px-3 py-1">Output verified</span></div>}
+            {canDownload && <div className="mt-3 flex flex-wrap gap-2"><Button variant="primary" onClick={() => downloadAsset(runtime, result.id)}><Download /> Download reviewed copy</Button>{runtime.store.getState().files[result.id]?.type === "image/png" && <Button variant="secondary" onClick={() => void copyPng()} data-testid="safe-share-copy-png"><Copy /> Copy PNG</Button>}</div>}
+            {canDownload && <ContinueWith tools={continuationsFor(tool)} fileId={result.id} />}
           </div>
         )
       }

@@ -257,6 +257,8 @@ export function createWorkflowAdapters(runtime: WorkspaceRuntime, outputs: Workf
           format: step.config.format ?? "same",
           quality: step.config.quality ?? 0.82,
           targetBytes: step.config.targetBytes ?? null,
+          // Workflow compression never inherits an extra resize from the Compressor UI.
+          resizePercent: 100,
         });
         const result = await runtime.encodeAsset("compress", file.id);
         check(context);

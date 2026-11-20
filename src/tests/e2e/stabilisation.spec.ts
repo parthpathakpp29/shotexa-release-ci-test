@@ -236,7 +236,11 @@ test.describe("cross-tool chains without re-upload", () => {
     expect([d.width, d.height]).toEqual([88, 120]);
     expect(near(d.samples[0], [...RED, 255], 40)).toBe(true);
     expect(d.samples[1][3]).toBeLessThanOrEqual(10); // transparency survived Combine → Split → Editor → WebP
-    await expectNewestSelected(page, 7, out.name);
+    await expect(page.getByTestId("file-item")).toHaveCount(7);
+    await expect(page.getByTestId("file-item").last()).toContainText(out.name);
+    // Phase 2 keeps the Compressor's original selected so its before/after view stays valid.
+    await expect(page.getByTestId("file-item").nth(5).locator("button").first()).toHaveAttribute("aria-pressed", "true");
+    await expect(page.getByTestId("file-item").nth(5)).toContainText(edited.name);
     expect(outbound).toEqual([]);
     expect(errors).toEqual([]);
   });

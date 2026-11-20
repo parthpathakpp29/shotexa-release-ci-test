@@ -18,6 +18,7 @@ import { PdfError, toPdfError } from "./errors";
 import type { PageSetup, PageSlice } from "./types";
 import { slicePlacement } from "./coords";
 import { buildPdfTextRuns, type SearchableTextSource } from "./searchable-text";
+import { logicalTextFontkit } from "./logical-text-font";
 
 export interface RenderOptions {
   setup: PageSetup;
@@ -145,7 +146,7 @@ export async function assemblePdf(pages: AsyncIterable<EncodedPage> | Iterable<E
               return new Uint8Array(await response.arrayBuffer());
             }),
       ]);
-      doc.registerFontkit(fontkitModule.default);
+      doc.registerFontkit(logicalTextFontkit(fontkitModule.default));
       searchableFont = await doc.embedFont(fontBytes, { subset: true });
       supportedCodepoints = new Set(searchableFont.getCharacterSet());
     }
@@ -193,7 +194,7 @@ export async function assemblePdf(pages: AsyncIterable<EncodedPage> | Iterable<E
       );
       const fontKeys = new Map<number, import("pdf-lib").PDFName>();
       for (const run of runs) {
-        const text = Array.from(run.text)
+        const text = run.separator ? " " : Array.from(run.text)
           .filter((char) => char === " " || char === "\t" || supportedCodepoints!.has(char.codePointAt(0)!))
           .join("")
           .trim();

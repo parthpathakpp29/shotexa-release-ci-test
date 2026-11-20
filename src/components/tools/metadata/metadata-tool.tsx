@@ -23,7 +23,7 @@ function MetadataWorkspace() {
   const file = useWorkspace((s) => (s.selectedId ? s.files[s.selectedId] : undefined));
   const [result, setResult] = useState<{ id: string; verification: MetadataVerification; changed: boolean } | null>(null);
   if (!selectedId || !file) return null;
-  return <MetadataAssetWorkspace key={selectedId} selectedId={selectedId} result={result} setResult={setResult} />;
+  return <MetadataAssetWorkspace key={selectedId} selectedId={selectedId} result={result?.id === selectedId ? result : null} setResult={setResult} />;
 }
 
 function MetadataAssetWorkspace({
@@ -76,14 +76,14 @@ function MetadataAssetWorkspace({
       ? { label: "Privacy Clean", onClick: clean, busy: cleaning }
       : inspection
         ? { label: "Download Original", onClick: () => downloadAsset(runtime, selectedId) }
-        : { label: "Inspecting…", onClick: () => undefined, disabled: true, busy: loading };
+        : { label: loading ? "Inspecting…" : "Inspection unavailable", onClick: () => undefined, disabled: true, busy: loading };
 
   return (
     <WorkspaceShell
       tool="metadata"
       status={
         <Badge tone={result?.verification.passed ? "success" : hasPrivacy ? "warning" : "neutral"} dot>
-          {result?.verification.passed ? "Verified clean" : loading ? "Inspecting locally" : hasPrivacy ? "Privacy metadata found" : "No privacy metadata found"}
+          {result?.verification.passed ? "Metadata removal verified" : loading ? "Inspecting locally" : !inspection ? "Inspection unavailable" : hasPrivacy ? "Privacy metadata found" : "No removable metadata detected"}
         </Badge>
       }
       inspectorTitle="Privacy Clean"
@@ -159,10 +159,12 @@ function MetadataAssetWorkspace({
                   ))}
                 </ul>
               </div>
+            ) : hasPrivacy ? (
+              <p className="text-sm text-warning">Removable metadata was detected without readable details.</p>
             ) : inspection ? (
               <div className="flex items-start gap-2 rounded-md border border-[#cfe5d6] bg-success-soft p-3 text-sm text-success">
                 <CheckCircle2 className="mt-0.5 size-4 shrink-0" />
-                <span>No privacy-sensitive metadata found.</span>
+                <span>No removable metadata detected by this inspection.</span>
               </div>
             ) : null}
           </InspectorSection>

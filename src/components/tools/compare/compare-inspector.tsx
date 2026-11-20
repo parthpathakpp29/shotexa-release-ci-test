@@ -235,7 +235,7 @@ export function CompareInspector({ onDrawIgnore }: { onDrawIgnore?: (on: boolean
                 <FieldLabel value={String(settings.threshold)}>Sensitivity</FieldLabel>
                 <Slider label="Difference sensitivity" value={120 - settings.threshold} min={0} max={120} onChange={(v) => apply({ threshold: 120 - v }, "threshold")} valueText={`colour tolerance ${settings.threshold}`} />
                 <p className="t-body-sm mt-2 text-ink-3">
-                  Higher sensitivity marks smaller changes. Shotexa shows <em>where</em> pixels differ — it does not interpret what changed.
+                  Higher sensitivity marks smaller changes. Colour tolerance {settings.threshold}/255 omits channel changes at or below that value unless the luminance gate detects them. Set tolerance to 0 for every measurable channel change.
                 </p>
               </div>
             ) : (
@@ -261,7 +261,7 @@ export function CompareInspector({ onDrawIgnore }: { onDrawIgnore?: (on: boolean
             </Disclosure>
 
             <Disclosure title="Noise and colour" className="mt-4">
-              <Toggle label="Ignore anti-aliasing" description="Sub-pixel shifts only" checked={settings.diff.ignoreAntialiasing} onChange={(ignoreAntialiasing) => patchDiff({ ignoreAntialiasing })} />
+              <Toggle label="Ignore anti-aliasing" description="Reduce small edge-shade noise; may omit faint edge changes. Whole-pixel shifts remain visible." checked={settings.diff.ignoreAntialiasing} onChange={(ignoreAntialiasing) => patchDiff({ ignoreAntialiasing })} />
               <Toggle className="mt-3" label="Ignore near-identical colour" description="Under the just-noticeable difference" checked={settings.diff.ignoreNearIdenticalColour} onChange={(ignoreNearIdenticalColour) => patchDiff({ ignoreNearIdenticalColour })} />
               <div className="mt-3">
                 <FieldLabel value={String(settings.diff.luminanceTolerance)}>Luminance tolerance</FieldLabel>

@@ -69,7 +69,7 @@ export interface CompareDiffSettings {
   luminanceTolerance: number;
   /** Perceptual metric: delta-E*ab at or below this counts as unchanged. 2.3 is the classic JND. */
   deltaE: number;
-  /** Drop changed pixels whose colour simply moved to a neighbouring pixel (sub-pixel shift). */
+  /** Optional heuristic for small edge-shade noise; whole-pixel shifts remain differences. */
   ignoreAntialiasing: boolean;
   /** Drop changed pixels whose CIE76 delta-E*ab is under the just-noticeable difference. */
   ignoreNearIdenticalColour: boolean;
@@ -244,6 +244,8 @@ export interface CompareVisualAnalysis extends CompareStats {
   metric: CompareMetric;
   /** Cell pixels per analysis pixel, so boxes can be mapped back to the screenshots. */
   analysisScale: number;
+  /** Input bitmap pixels per original source pixel (below 1 for reduced previews). */
+  sourceScale?: number;
 }
 
 export type CompareTextChangeKind = "added" | "removed" | "changed";

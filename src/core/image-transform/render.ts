@@ -11,6 +11,7 @@
 import { DEFAULT_LIMITS } from "@/config/limits";
 import { createPngStreamEncoder } from "@/core/export/png-stream-encoder";
 import { readImageSize } from "@/core/image/image-size";
+import { FORMAT_MIME } from "@/core/image-encode/formats";
 import { chooseOutputStrategy, type OutputFormat } from "@/core/image/output-strategy";
 import { encodeCanvas, prepareBackground } from "@/core/image-encode/encode";
 import { drawTransformed } from "./matrix";
@@ -143,7 +144,7 @@ export async function renderDecoded(bitmap: ImageBitmap, t: ImageTransform, o: T
   if (o.signal?.aborted) throw new EditorError("EDITOR_CANCELLED");
   // Encoders can crop silently (Chromium WebP beyond 16,383 px): never hand back a wrong size.
   const size = await readImageSize(blob);
-  if (!size || size.width !== out.width || size.height !== out.height) throw new EditorError("EDITOR_EXPORT_VERIFY_FAILED", `${size?.width}x${size?.height}`);
+  if (!size || size.format !== o.format || blob.type !== FORMAT_MIME[o.format] || size.width !== out.width || size.height !== out.height) throw new EditorError("EDITOR_EXPORT_VERIFY_FAILED", `${size?.width}x${size?.height}`);
   o.onProgress?.(1);
   return { blob, width: out.width, height: out.height, strategy: plan.strategy, ms: Math.round(performance.now() - started) };
 }

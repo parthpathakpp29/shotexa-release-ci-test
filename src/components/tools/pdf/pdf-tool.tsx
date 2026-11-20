@@ -9,6 +9,7 @@ import { ContinueWith } from "@/components/workspace/continue-with";
 import { useWorkspace, useWorkspaceContext } from "@/components/workspace/workspace-provider";
 import { WorkspaceShell } from "@/components/workspace/workspace-shell";
 import { continuationsFor } from "@/config/tools";
+import { hasOcrText } from "@/core/ocr/normalize";
 import { addBreak, moveBreak, removeBreak, snapTo, validateBreaks } from "@/core/pdf/breaks";
 import type { PageBreak, PageSetup } from "@/core/pdf/types";
 import { messageFor } from "@/core/runtime/messages";
@@ -83,9 +84,11 @@ function PdfWorkspace({ searchable }: { searchable: boolean }) {
   }, [runtime, inputSignature, session.paper, session.marginPt, session.smart, editSignature]);
 
   const plan = session.plan;
-  const readyOcrIds = inputIds.filter((id) => ocr.byAsset[id]?.status === "done" && ocr.byAsset[id]?.language === ocr.language && !!ocr.byAsset[id]?.resultId && !!runtime.ocrResults.forAsset(id));
-  const missingOcrIds = inputIds.filter((id) => !readyOcrIds.includes(id));
-  const ocrReady = !searchable || missingOcrIds.length === 0;
+  const processedOcrIds = inputIds.filter((id) => ocr.byAsset[id]?.status === "done" && ocr.byAsset[id]?.language === ocr.language && !!ocr.byAsset[id]?.resultId && !!runtime.ocrResults.forAsset(id));
+  const readyOcrIds = processedOcrIds.filter((id) => hasOcrText(runtime.ocrResults.forAsset(id)));
+  const emptyOcrIds = processedOcrIds.filter((id) => !readyOcrIds.includes(id));
+  const missingOcrIds = inputIds.filter((id) => !processedOcrIds.includes(id));
+  const ocrReady = !searchable || missingOcrIds.length === 0 && readyOcrIds.length > 0;
   const activeOcr = inputIds.map((id) => ocr.byAsset[id]).find((state) => state?.status === "running");
   const ocrFailure = inputIds.map((id) => ocr.byAsset[id]).find((state) => state?.status === "failed");
   const breakEntries = useMemo(() => {
@@ -197,13 +200,15 @@ function PdfWorkspace({ searchable }: { searchable: boolean }) {
   };
 
   const extractMissing = async () => {
-    if (!searchable || extractingMissing || !missingOcrIds.length) return;
+    const pendingIds = missingOcrIds.length ? missingOcrIds : emptyOcrIds;
+    if (!searchable || extractingMissing || !pendingIds.length) return;
     const sequence = ++extractionSequence.current;
     setExtractingMissing(true);
     try {
-      for (const id of missingOcrIds) {
-        if (sequence !== extractionSequence.current || runtime.ocrResults.forAsset(id)) continue;
-        await runtime.extractText(id, ocr.language);
+      for (const id of pendingIds) {
+        if (sequence !== extractionSequence.current) break;
+        try { await runtime.extractText(id, ocr.language); }
+        catch { if (sequence !== extractionSequence.current) break; }
       }
     } catch {
       // Controlled OCR state and error copy are already stored per asset.
@@ -326,8 +331,8 @@ function PdfWorkspace({ searchable }: { searchable: boolean }) {
             <InspectorSection title="Searchable text" data-testid="searchable-pdf-ocr">
               <div className="rounded-md border border-line bg-surface-3 p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <span className="text-sm font-medium">{ocrReady ? "Text layer ready" : "Text extraction required"}</span>
-                  <Badge tone={ocrReady ? "success" : extractingMissing ? "accent" : "warning"} dot>
+                  <span className="text-sm font-medium">{ocrReady ? emptyOcrIds.length ? "Text layer partially ready" : "Text layer ready" : emptyOcrIds.length && !missingOcrIds.length ? "No searchable text found" : "Text extraction required"}</span>
+                  <Badge tone={ocrReady && !emptyOcrIds.length ? "success" : extractingMissing ? "accent" : "warning"} dot>
                     {readyOcrIds.length}/{inputIds.length} ready
                   </Badge>
                 </div>
@@ -336,12 +341,17 @@ function PdfWorkspace({ searchable }: { searchable: boolean }) {
                     <li key={id} className="flex items-center justify-between gap-2">
                       <span className="min-w-0 truncate">{files[id]?.name}</span>
                       <span className={readyOcrIds.includes(id) ? "text-success" : "text-warning"}>
-                        {readyOcrIds.includes(id) ? "Ready" : ocr.byAsset[id]?.status === "running" ? "Extracting…" : "Needs OCR"}
+                        {readyOcrIds.includes(id) ? "Ready" : emptyOcrIds.includes(id) ? "No text found" : ocr.byAsset[id]?.status === "running" ? "Extracting…" : ocr.byAsset[id]?.status === "failed" ? "OCR failed" : "Needs OCR"}
                       </span>
                     </li>
                   ))}
                 </ul>
               </div>
+              {emptyOcrIds.length > 0 && (
+                <Notice className="mt-3" tone="warning" title={readyOcrIds.length ? "Some screenshots have no searchable text" : "No readable text was found"} data-testid="pdf-empty-ocr">
+                  {readyOcrIds.length ? `${emptyOcrIds.length} screenshot(s) will remain image-only. Review the selected language and the original images before exporting.` : "Try a clearer copy or another OCR language. Use Screenshot to PDF if you need an image-only document."}
+                </Notice>
+              )}
               <div className="mt-3">
                 <SegmentedControl<OcrLanguageChoice>
                   label="OCR language"
@@ -368,12 +378,16 @@ function PdfWorkspace({ searchable }: { searchable: boolean }) {
                 </div>
               ) : !ocrReady ? (
                 <Button className="mt-3 w-full" variant="primary" onClick={extractMissing} data-testid="extract-for-searchable-pdf">
-                  <ScanText /> Extract text for searchable PDF
+                  <ScanText /> {missingOcrIds.length ? "Extract text for searchable PDF" : "Extract text again"}
                 </Button>
               ) : (
-                <p className="mt-3 text-xs leading-5 text-ink-3">
+                <div className="mt-3 space-y-3">
+                <p className="text-xs leading-5 text-ink-3">
                   Original OCR geometry positions the invisible text layer. Edits made in Screenshot to Text remain for Copy/TXT only.
                 </p>
+                <p className="text-xs leading-5 text-ink-3">Search and copy use recognized English and Hindi text. Review OCR mistakes; symbols unsupported by the embedded font may be omitted. The visible screenshots stay unchanged.</p>
+                {emptyOcrIds.length > 0 && <Button className="w-full" variant="secondary" onClick={extractMissing} data-testid="retry-empty-ocr">Retry screenshots with no text</Button>}
+                </div>
               )}
             </InspectorSection>
           )}

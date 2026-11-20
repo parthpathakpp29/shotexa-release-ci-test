@@ -13,6 +13,7 @@ import { encodeCanvas } from "@/core/image-encode/encode";
 import { toEncodeError } from "@/core/image-encode/reencode";
 import { EncodeError } from "@/core/image-encode/types";
 import { readImageSize } from "@/core/image/image-size";
+import { FORMAT_MIME } from "@/core/image-encode/formats";
 import { chooseOutputStrategy, type OutputFormat } from "@/core/image/output-strategy";
 import { decodeSource } from "@/core/image-transform/render";
 import type { Size } from "@/core/image-transform/types";
@@ -136,7 +137,7 @@ export async function renderBeautified(image: Blob, settings: BeautifySettings, 
   }
   // Encoders can crop silently (Chromium WebP beyond 16,383 px): never hand back a wrong size.
   const size = await readImageSize(blob);
-  if (!size || size.width !== out.width || size.height !== out.height) throw new EncodeError("ENCODE_VERIFY_FAILED", `${size?.width}x${size?.height}`);
+  if (!size || size.format !== o.format || blob.type !== FORMAT_MIME[o.format] || size.width !== out.width || size.height !== out.height) throw new EncodeError("ENCODE_VERIFY_FAILED", `${size?.width}x${size?.height}`);
   o.onProgress?.(1);
   return { blob, width: out.width, height: out.height, strategy: plan.strategy, ms: Math.round(performance.now() - started) };
 }

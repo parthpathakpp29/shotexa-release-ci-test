@@ -1,0 +1,30 @@
+[
+  {
+    "id": "transparent-small",
+    "file": "transparent-small/image.png",
+    "width": 640,
+    "height": 200,
+    "language": "eng"
+  },
+  {
+    "id": "colored-dark",
+    "file": "colored-dark/image.png",
+    "width": 720,
+    "height": 280,
+    "language": "eng"
+  },
+  {
+    "id": "strip-boundaries",
+    "file": "strip-boundaries/image.png",
+    "width": 720,
+    "height": 8800,
+    "language": "eng"
+  },
+  {
+    "id": "unicode-layout",
+    "file": "unicode-layout/image.png",
+    "width": 950,
+    "height": 330,
+    "language": "eng+hin"
+  }
+]

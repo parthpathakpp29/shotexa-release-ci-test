@@ -44,6 +44,7 @@ export function sanitizeSvg(input: string): { svg: string; width: number; height
 
 export async function convertSvg(svg: string, width: number, height: number, format: RasterFormat, background = "#ffffff", quality = 0.92): Promise<Blob> {
   assertRasterSize(width, height);
+  if (!Number.isInteger(width) || !Number.isInteger(height)) throw new Error("Use whole pixels for width and height.");
   const url = URL.createObjectURL(new Blob([svg], { type: "image/svg+xml" }));
   const image = new Image();
   const canvas = document.createElement("canvas");

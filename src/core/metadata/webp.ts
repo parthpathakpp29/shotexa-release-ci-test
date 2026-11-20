@@ -9,7 +9,7 @@
  */
 import { ascii, checkRange, concat, fourcc, METADATA_LIMITS, startsWith, u24le, u32le, writeU32le } from "./bytes";
 import { malformed } from "./errors";
-import { minimalOrientationTiff, readExif } from "./exif";
+import { isMinimalOrientationTiff, minimalOrientationTiff, readExif } from "./exif";
 import { item, type ClassifiedElement, type FormatAnalysis } from "./policy";
 import type { MetadataPolicy, MetadataWarning, PrivacyFinding } from "./types";
 import { scanXmp } from "./xmp";
@@ -111,7 +111,7 @@ export function analyseWebp(b: Uint8Array, policy: MetadataPolicy): FormatAnalys
         const tiff = startsWith(data, 0, "Exif\0\0") ? data.subarray(6) : data;
         const r = readExif(tiff, "WebP EXIF");
         if (r.malformed) warnings.push({ code: "MALFORMED_METADATA_BLOCK", message: "EXIF chunk is malformed (removed)" });
-        const onlyOrientation = !r.malformed && r.tagCount === 1 && r.orientation !== undefined && !r.thumbnail;
+        const onlyOrientation = isMinimalOrientationTiff(tiff, r.orientation);
         if (exifSeen === 1 && r.orientation !== undefined) orientation = r.orientation;
         const findings: PrivacyFinding[] = onlyOrientation ? [] : [{ category: "exif", label: `EXIF block (${size} bytes)`, source: "WebP EXIF" }, ...r.findings];
         if (!onlyOrientation && r.orientation !== undefined) findings.push({ category: "orientation", label: "Orientation", source: "WebP EXIF", value: String(r.orientation) });

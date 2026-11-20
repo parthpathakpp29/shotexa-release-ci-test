@@ -58,7 +58,7 @@ export function suggest(input: { format: OutputFormat; quality: number; comparis
   if (format === "png") {
     // The browser's PNG encoder is lossless with no quality setting: the only lever is the format.
     if (probeWins) return { message: `${probeLabel} would be ${probeSaving!.percent}% smaller than the original.`, apply: { format: probe!.format, quality: probe!.quality } };
-    if (comparison.outcome !== "smaller") return { message: "PNG is lossless, so this screenshot can't get smaller as PNG. Try WebP for a smaller file.", apply: { format: "webp", quality: SUGGESTED_QUALITY } };
+    if (comparison.outcome !== "smaller") return { message: "This PNG encode did not reduce the file size. Measure WebP to compare its size and text detail.", apply: { format: "webp", quality: SUGGESTED_QUALITY } };
     return null;
   }
   if (comparison.outcome === "smaller") return null;

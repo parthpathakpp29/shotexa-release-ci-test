@@ -7,12 +7,15 @@
 import { DEFAULT_LIMITS } from "@/config/limits";
 import { chooseOutputStrategy } from "@/core/image/output-strategy";
 import type { OutputFormat } from "./formats";
+import { encodeSize } from "./geometry";
 
 export type EncodeIssue = "format-dimension" | "too-large" | "source-too-large";
 
-export function encodeIssue(size: { width: number; height: number }, format: OutputFormat, compressionStream = true): EncodeIssue | null {
+export function encodeIssue(size: { width: number; height: number }, format: OutputFormat, compressionStream = true, percent = 100): EncodeIssue | null {
+  if (!Number.isFinite(size.width) || !Number.isFinite(size.height) || size.width <= 0 || size.height <= 0) return "source-too-large";
+  const output = encodeSize(size, percent);
   const d = chooseOutputStrategy(
-    { width: size.width, height: size.height, format, largestSourceBytes: size.width * size.height * 4 },
+    { ...output, format, largestSourceBytes: size.width * size.height * 4 },
     { offscreenCanvas: true, compressionStream },
     DEFAULT_LIMITS,
   );

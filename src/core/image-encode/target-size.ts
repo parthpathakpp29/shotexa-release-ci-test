@@ -5,6 +5,7 @@
  * whole-percent quality at or below the target and retains the smallest measured fallback when
  * even 50% cannot meet it. It never resizes or changes the user-selected format.
  */
+import { EncodeError } from "./types";
 export const MIN_TARGET_QUALITY = 0.5;
 export const MAX_TARGET_ATTEMPTS = 7;
 
@@ -19,6 +20,7 @@ export async function searchTargetSize(
   targetBytes: number,
   maximumQuality: number,
   measure: (quality: number) => Promise<number>,
+  options: { signal?: { readonly aborted: boolean }; onAttempt?(attempts: number): void } = {},
 ): Promise<TargetSizeSearch> {
   let low = Math.round(MIN_TARGET_QUALITY * 100);
   let high = Math.max(low, Math.min(100, Math.round(maximumQuality * 100)));
@@ -27,11 +29,14 @@ export async function searchTargetSize(
   let attempts = 0;
 
   while (low <= high && attempts < MAX_TARGET_ATTEMPTS) {
+    if (options.signal?.aborted) throw new EncodeError("ENCODE_CANCELLED");
     // Check the user-selected quality first. It avoids unnecessary work when it already fits.
     const qualityPct = attempts === 0 ? high : Math.ceil((low + high) / 2);
     const quality = qualityPct / 100;
     const bytes = await measure(quality);
+    if (options.signal?.aborted) throw new EncodeError("ENCODE_CANCELLED");
     attempts += 1;
+    options.onAttempt?.(attempts);
     const measured = { quality, bytes, metTarget: bytes <= targetBytes, attempts };
     if (!smallest || bytes < smallest.bytes) smallest = measured;
     if (bytes <= targetBytes) {

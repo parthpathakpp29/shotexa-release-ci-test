@@ -178,7 +178,7 @@ function drawDifference(
     ctx.putImageData(la, 0, 0);
     ctx.restore();
     // Grouping consumes the mask; the rendered picture above is already final.
-    return analyseComparison(result, {
+    const analysis = analyseComparison(result, {
       width,
       height,
       analysisScale: 1 / Math.max(0.0001, scale),
@@ -189,6 +189,7 @@ function drawDifference(
       ignoreTiny: layout.ignoreTiny,
       placements: { a: layout.a, b: layout.b },
     });
+    return { ...analysis, sourceScale: Math.min(a.imageScale, b.imageScale) };
   } finally {
     for (const c of [left, right]) {
       if (!c) continue;

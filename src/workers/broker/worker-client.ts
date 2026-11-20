@@ -20,48 +20,64 @@ export interface RunOptions {
 export function createWorkerClient(factory: () => Worker) {
   let worker: Worker | null = null;
   let seq = 0;
-  const pending = new Map<string, { resolve(v: unknown): void; reject(e: unknown): void; onProgress?: RunOptions["onProgress"] }>();
+  const pending = new Map<string, { resolve(v: unknown): void; reject(e: unknown): void; onProgress?: RunOptions["onProgress"]; signal?: AbortSignal; cleanup(): void }>();
+  const releasePreview = (msg: WorkerResponse) => {
+    if (msg.type === "SUCCESS" && msg.jobId.startsWith("image.preview:")) (msg.output as WorkerOps["image.preview"]["output"]).bitmap.close();
+  };
 
   const ensure = () => {
     if (worker) return worker;
-    worker = factory();
-    worker.addEventListener("message", (e: MessageEvent<WorkerResponse>) => {
+    const current = factory();
+    worker = current;
+    current.addEventListener("message", (e: MessageEvent<WorkerResponse>) => {
       const msg = e.data;
+      if (worker !== current) { releasePreview(msg); return; }
       const job = pending.get(msg.jobId);
-      if (!job) return;
-      if (msg.type === "PROGRESS") return job.onProgress?.(msg.progress, msg.stage);
+      if (!job) { releasePreview(msg); return; }
+      if (msg.type === "PROGRESS") return !job.signal?.aborted && job.onProgress?.(msg.progress, msg.stage);
       pending.delete(msg.jobId);
-      if (msg.type === "SUCCESS") job.resolve(msg.output);
+      job.cleanup();
+      if (job.signal?.aborted) { releasePreview(msg); job.reject(new WorkerJobError("CANCELLED")); }
+      else if (msg.type === "SUCCESS") job.resolve(msg.output);
       else if (msg.type === "CANCELLED") job.reject(new WorkerJobError("CANCELLED"));
       else job.reject(new WorkerJobError(msg.code));
     });
-    worker.addEventListener("error", (event) => {
+    current.addEventListener("error", (event) => {
       // Handled here — every waiting job is rejected — so it must not also surface as an
       // uncaught page error (e.g. a worker script whose load the page's teardown cancelled).
       event.preventDefault();
-      for (const job of pending.values()) job.reject(new WorkerJobError("WORKER_CRASHED"));
+      // An error queued by a retired worker belongs to that instance, not its replacement.
+      if (worker !== current) return;
+      for (const job of pending.values()) { job.cleanup(); job.reject(new WorkerJobError("WORKER_CRASHED")); }
       pending.clear();
-      worker?.terminate();
+      current.terminate();
       worker = null;
     });
-    return worker;
+    return current;
   };
 
   return {
     run<K extends OpName>(op: K, input: WorkerOps[K]["input"], opts: RunOptions = {}): Promise<WorkerOps[K]["output"]> {
+      if (opts.signal?.aborted) return Promise.reject(new WorkerJobError("CANCELLED"));
       const w = ensure();
       const jobId = `${op}:${++seq}`;
       return new Promise((resolve, reject) => {
-        pending.set(jobId, { resolve: resolve as (v: unknown) => void, reject, onProgress: opts.onProgress });
-        opts.signal?.addEventListener("abort", () => w.postMessage({ version: PROTOCOL_VERSION, jobId, type: "CANCEL" } satisfies WorkerRequest), { once: true });
-        w.postMessage({ version: PROTOCOL_VERSION, jobId, type: "RUN", op, input } as WorkerRequest);
+        const cancel = () => {
+          try { w.postMessage({ version: PROTOCOL_VERSION, jobId, type: "CANCEL" } satisfies WorkerRequest); }
+          catch { pending.delete(jobId); cleanup(); reject(new WorkerJobError("CANCELLED")); }
+        };
+        const cleanup = () => opts.signal?.removeEventListener("abort", cancel);
+        pending.set(jobId, { resolve: resolve as (v: unknown) => void, reject, onProgress: opts.onProgress, signal: opts.signal, cleanup });
+        opts.signal?.addEventListener("abort", cancel, { once: true });
+        try { w.postMessage({ version: PROTOCOL_VERSION, jobId, type: "RUN", op, input } as WorkerRequest); }
+        catch { pending.delete(jobId); cleanup(); reject(new WorkerJobError("WORKER_CRASHED")); }
       });
     },
-    /** Hard termination — fallback for a stuck worker only. */
+    /** Terminate this instance and cancel its pending jobs. */
     terminate() {
       worker?.terminate();
       worker = null;
-      for (const job of pending.values()) job.reject(new WorkerJobError("CANCELLED"));
+      for (const job of pending.values()) { job.cleanup(); job.reject(new WorkerJobError("CANCELLED")); }
       pending.clear();
     },
   };

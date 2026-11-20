@@ -5,27 +5,33 @@
  * VerificationCard, ToolTab. Keyboard accessible; ≥ 44 px targets on touch screens.
  */
 import { ChevronDown, Check } from "lucide-react";
-import { useId, useState, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
 export function SegmentedControl<T extends string>({ value, onChange, options, label, className, size = "md" }: { value: T; onChange: (v: T) => void; options: { value: T; label: ReactNode }[]; label: string; className?: string; size?: "sm" | "md" }) {
+  const buttons = useRef<(HTMLButtonElement | null)[]>([]);
   return (
     <div role="radiogroup" aria-label={label} className={cn("grid auto-cols-fr grid-flow-col gap-1 rounded-md border border-line bg-surface-3 p-1", className)}>
-      {options.map((o) => {
+      {options.map((o, index) => {
         const active = o.value === value;
         return (
           <button
             key={o.value}
+            ref={(element) => { buttons.current[index] = element; }}
             type="button"
             role="radio"
             aria-checked={active}
             onClick={() => onChange(o.value)}
             onKeyDown={(e) => {
-              if (e.key !== "ArrowRight" && e.key !== "ArrowLeft") return;
+              let next: number;
+              if (e.key === "ArrowRight" || e.key === "ArrowDown") next = (index + 1) % options.length;
+              else if (e.key === "ArrowLeft" || e.key === "ArrowUp") next = (index + options.length - 1) % options.length;
+              else if (e.key === "Home") next = 0;
+              else if (e.key === "End") next = options.length - 1;
+              else return;
               e.preventDefault();
-              const i = options.findIndex((x) => x.value === value);
-              const next = options[(i + (e.key === "ArrowRight" ? 1 : options.length - 1)) % options.length];
-              onChange(next.value);
+              onChange(options[next].value);
+              buttons.current[next]?.focus();
             }}
             tabIndex={active ? 0 : -1}
             className={cn(
@@ -50,18 +56,22 @@ export function Toggle({ checked, onChange, label, description, className }: { c
     // The whole row is the label, so the tap target is the row rather than the small switch.
     <label htmlFor={id} className={cn("flex cursor-pointer items-center justify-between gap-4 rounded-md border border-line bg-surface-3 p-3.5", className)}>
       <span className="min-w-0">
-        <span className="block text-sm font-medium text-ink">{label}</span>
-        {description && <span className="t-mono mt-0.5 block text-[12px] text-accent-ink">{description}</span>}
+        <span id={`${id}-label`} className="block text-sm font-medium text-ink">{label}</span>
+        {description && <span id={`${id}-description`} className="t-mono mt-0.5 block text-[12px] text-accent-ink">{description}</span>}
       </span>
       <button
         id={id}
         type="button"
         role="switch"
         aria-checked={checked}
+        aria-labelledby={`${id}-label`}
+        aria-describedby={description ? `${id}-description` : undefined}
         onClick={() => onChange(!checked)}
-        className={cn("relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border transition-colors duration-150", checked ? "border-accent bg-accent" : "border-line-strong bg-surface-2")}
+        className="relative inline-flex h-7 w-12 shrink-0 items-center rounded-full max-md:h-11"
       >
-        <span className={cn("inline-block size-5 rounded-full bg-white shadow-sm transition-transform duration-150", checked ? "translate-x-[22px]" : "translate-x-[3px]")} />
+        <span aria-hidden className={cn("flex h-7 w-12 items-center rounded-full border transition-colors duration-150", checked ? "border-accent bg-accent" : "border-line-strong bg-surface-2")}>
+          <span className={cn("inline-block size-5 rounded-full bg-white shadow-sm transition-transform duration-150", checked ? "translate-x-[22px]" : "translate-x-[3px]")} />
+        </span>
       </button>
     </label>
   );
@@ -80,7 +90,7 @@ export function Slider({ value, min, max, step = 1, onChange, label, id, classNa
       step={step}
       value={value}
       onChange={(e) => onChange(Number(e.target.value))}
-      className={cn("shotexa-range h-6 w-full cursor-pointer appearance-none bg-transparent", className)}
+      className={cn("shotexa-range h-6 w-full cursor-pointer appearance-none bg-transparent max-md:h-11", className)}
       style={{ ["--pct" as string]: `${pct}%` }}
     />
   );

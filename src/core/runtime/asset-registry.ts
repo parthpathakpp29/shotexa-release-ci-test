@@ -64,6 +64,12 @@ export class AssetRegistry {
   }
 
   /** Diagnostics for tests (counts only — never contents). */
+  previewMemory() {
+    let pixels = 0;
+    for (const preview of this.#previews.values()) pixels += preview.width * preview.height;
+    return { pixels, bytes: pixels * 4 };
+  }
+
   stats() {
     let bytes = 0;
     for (const b of this.#blobs.values()) bytes += b.size;

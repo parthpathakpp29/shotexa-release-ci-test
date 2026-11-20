@@ -2,6 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { FIXTURE_DIR } from "../helpers/stitch-fixtures";
+import { isPreviewConsoleError } from "../helpers/preview-errors";
 
 /**
  * Leaving a page while previews are still being made must not raise a page error (WebKit:
@@ -35,9 +36,9 @@ function pageErrors(page: Page) {
     if (/^Fetch API cannot load/.test(text) && /[?&]_rsc=/.test(text)) return;
     errors.push(`${page.url()}: ${text}`);
   });
-  // Blob loads only: WebKit also logs Next.js route prefetches that a navigation cancels
+  // Preview/worker loads: WebKit also logs route prefetches that a navigation cancels
   // ("Fetch API cannot load …?_rsc=…"), which are the router's own requests, not page errors.
-  page.on("console", (message) => { if (message.type() === "error" && /blob:/i.test(message.text())) errors.push(`${page.url()}: ${message.text()}`); });
+  page.on("console", (message) => { if (isPreviewConsoleError(message.type(), message.text())) errors.push(`${page.url()}: ${message.text()}`); });
   return errors;
 }
 
@@ -90,7 +91,7 @@ test.describe("Preview lifecycle", () => {
     const run = page.getByRole("button", { name: /Check file size|Check again/ }).first();
     await run.click();
     await expect(page.getByTestId("encode-result-image")).toBeVisible({ timeout: 120_000 });
-    expect(await liveBlobUrls(page)).toBe(1);
+    expect(await liveBlobUrls(page)).toBe(2); // Phase 2 compares the original Blob and encoded Blob.
 
     const formats = page.getByRole("radiogroup", { name: "Output format" });
     for (const format of ["WebP", "JPEG", "WebP", "PNG", "JPEG"]) {
@@ -99,7 +100,7 @@ test.describe("Preview lifecycle", () => {
       await page.getByRole("button", { name: /Check file size|Check again|Check new size/ }).first().click();
       // A finished encode shows its size; a stale result shows only the target format.
       await expect(page.getByTestId("encode-result-meta")).toHaveText(new RegExp(`^${format}.*\\d+(\\.\\d)? (KB|MB)$`), { timeout: 120_000 });
-      await expect.poll(() => liveBlobUrls(page)).toBe(1);
+      await expect.poll(() => liveBlobUrls(page)).toBe(2);
     }
 
     await leaveToHome(page);

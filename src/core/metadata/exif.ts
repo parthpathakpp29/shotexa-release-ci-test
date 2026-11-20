@@ -216,3 +216,9 @@ export function minimalOrientationTiff(orientation: number): Uint8Array {
   // next IFD offset = 0 (bytes 22..25)
   return b;
 }
+
+/** Tag counts alone do not rule out private data in unused TIFF bytes. */
+export function isMinimalOrientationTiff(bytes: Uint8Array, orientation: number | undefined): boolean {
+  if (orientation === undefined || bytes.length !== 26) return false;
+  return minimalOrientationTiff(orientation).every((byte, index) => byte === bytes[index]);
+}

@@ -533,6 +533,8 @@ test.describe("Phase 2L Screenshot Beautifier", () => {
 
   test("mobile: preview, settings sheet, sticky export", async ({ page }) => {
     await page.setViewportSize({ width: 390, height: 844 });
+    // This case exercises the consent panel too, even under the pre-declined quality config.
+    await page.addInitScript(() => localStorage.removeItem("shotexa.analytics-consent.v1"));
     const { errors } = watch(page);
     await open(page, solid("phone.png", 1170, 2532, RED));
     await page.getByRole("button", { name: "Reject Google Analytics" }).click();

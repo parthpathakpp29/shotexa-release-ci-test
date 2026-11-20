@@ -5,6 +5,7 @@ import { useState } from "react";
 import { cn } from "@/lib/cn";
 import { formatBytes, imageTypeLabel } from "@/lib/format-bytes";
 import { downloadAsset } from "@/core/runtime/runtime";
+import { imageMemoryWarning } from "@/core/image/preview-size";
 import { BitmapCanvas } from "./bitmap-canvas";
 import { useDropTarget, useWorkspace, useWorkspaceContext } from "./workspace-provider";
 
@@ -16,6 +17,7 @@ export function FileTray({ hint, className, onAfterSelect }: { hint?: string; cl
   const { runtime, openPicker } = useWorkspaceContext();
   const order = useWorkspace((s) => s.order);
   const files = useWorkspace((s) => s.files);
+  const jobs = useWorkspace((s) => s.jobs);
   const selectedId = useWorkspace((s) => s.selectedId);
   const documentOrder = useWorkspace((s) => s.documentOrder);
   const documents = useWorkspace((s) => s.documents);
@@ -77,7 +79,7 @@ export function FileTray({ hint, className, onAfterSelect }: { hint?: string; cl
                 }}
                 className="relative block h-24 w-full overflow-hidden border-b border-line bg-surface-2 text-left"
               >
-                <BitmapCanvas id={id} width={240} label="" className="pointer-events-none" />
+                <BitmapCanvas id={id} width={240} thumbnailHeight={96} label="" className="pointer-events-none" />
                 <span className="t-mono absolute left-2 top-2 inline-flex size-6 items-center justify-center rounded-xs bg-dark text-[11px] text-white">{i + 1}</span>
                 <span className="t-mono absolute bottom-2 right-2 rounded-xs bg-dark/85 px-1.5 py-0.5 text-[10.5px] text-white">
                   {f.width} × {f.height}
@@ -116,6 +118,8 @@ export function FileTray({ hint, className, onAfterSelect }: { hint?: string; cl
                   <Trash2 className="size-3.5" />
                 </button>
               </div>
+              {!f.previewVersion && <p className="px-2 pb-2 text-xs text-ink-3">{jobs[`preview:${id}`]?.status === "failed" ? "Preview unavailable · original kept" : jobs[`preview:${id}`]?.status === "cancelled" ? "Preview stopped · original kept" : "Preparing preview…"}</p>}
+              {imageMemoryWarning(f) && <p className="px-2 pb-2 text-xs leading-5 text-ink-2">{imageMemoryWarning(f)}</p>}
             </li>
           );
         })}

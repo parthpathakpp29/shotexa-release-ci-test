@@ -134,7 +134,7 @@ export async function renderSafeShare(image: Blob, operations: Redaction[], opti
     });
     const decodedOk = decoded.width === bitmap.width && decoded.height === bitmap.height;
     decoded.close();
-    if (!decodedOk || !cleaned.verification.passed) throw new RedactionError("REDACTION_VERIFY_FAILED");
+    if (!decodedOk || !cleaned.verification.passed || finalBlob.type !== MIME[options.format]) throw new RedactionError("REDACTION_VERIFY_FAILED");
     options.onProgress?.(1, "verified");
     const done = performance.now();
     return {

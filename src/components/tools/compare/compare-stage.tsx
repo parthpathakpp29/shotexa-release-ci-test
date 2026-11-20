@@ -585,9 +585,12 @@ function sameAnalysis(a: CompareVisualAnalysis | null, b: CompareVisualAnalysis 
     a.ignoredPixels === b.ignoredPixels &&
     a.width === b.width &&
     a.height === b.height &&
+    a.analysisScale === b.analysisScale &&
+    a.sourceScale === b.sourceScale &&
+    a.regionsTruncated === b.regionsTruncated &&
     a.metric === b.metric &&
     a.regions.length === b.regions.length &&
-    a.regions.every((region, index) => region.id === b.regions[index].id && region.x === b.regions[index].x && region.y === b.regions[index].y && region.pixels === b.regions[index].pixels && region.kind === b.regions[index].kind)
+    a.regions.every((region, index) => region.id === b.regions[index].id && region.x === b.regions[index].x && region.y === b.regions[index].y && region.width === b.regions[index].width && region.height === b.regions[index].height && region.pixels === b.regions[index].pixels && region.kind === b.regions[index].kind && region.confidence === b.regions[index].confidence)
   );
 }
 

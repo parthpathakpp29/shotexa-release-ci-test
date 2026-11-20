@@ -317,6 +317,7 @@ export function createWorkspaceStore(onRemove?: (id: FileId) => void) {
           return {
             files,
             order,
+            jobs: Object.fromEntries(Object.entries(s.jobs).filter(([key]) => key !== `preview:${id}`)),
             selectedId: s.selectedId === id ? (order[0] ?? null) : s.selectedId,
             lastArtifactId: s.lastArtifactId === id ? null : s.lastArtifactId,
             // Undo entries may reference removed files/pairs: drop history rather than replay invalid steps.

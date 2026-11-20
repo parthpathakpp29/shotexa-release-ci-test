@@ -177,9 +177,10 @@ export async function createCompareReportPdf(options: CompareReportOptions): Pro
     rows(w, summaryRows(summary));
     rows(w, [
       { label: "Changed pixels (count)", value: `${summary.totals.changedPixels.toLocaleString("en-GB")} of ${summary.totals.comparedPixels.toLocaleString("en-GB")} compared` },
-      { label: "Pixels left out", value: `${summary.totals.ignoredPixels.toLocaleString("en-GB")} (ignore regions, transparency or ignored colour)` },
+      { label: "Pixels left out", value: `${(summary.totals.totalPixels - summary.totals.comparedPixels).toLocaleString("en-GB")} (ignore regions, transparency or ignored colour)` },
       { label: "Comparison resolution", value: summary.analysis ? `${summary.analysis.width} x ${summary.analysis.height} analysis px` : "Not analysed" },
     ]);
+    for (const warning of summary.warnings) paragraph(w, warning, { size: 8.5, colour: MUTED(lib) });
 
     heading(w, "Alignment");
     rows(w, [
@@ -191,7 +192,7 @@ export async function createCompareReportPdf(options: CompareReportOptions): Pro
       { label: "Match score", value: `${summary.alignment.score} (${summary.alignment.confidence} confidence)` },
     ]);
     if (summary.alignment.status === "failed" && summary.alignment.mode !== "off") {
-      paragraph(w, "Alignment could not be measured reliably, so the comparison ran without it.", { size: 8.5, colour: MUTED(lib) });
+      paragraph(w, "Automatic alignment could not be measured reliably. Only the manual offsets and scale listed above were applied.", { size: 8.5, colour: MUTED(lib) });
     }
 
     heading(w, "Files");

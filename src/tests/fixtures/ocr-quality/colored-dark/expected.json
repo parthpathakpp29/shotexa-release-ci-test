@@ -1,0 +1,46 @@
+{
+  "id": "colored-dark",
+  "width": 720,
+  "height": 280,
+  "font": 20,
+  "background": "#172234",
+  "colors": [
+    "#87f7b0",
+    "#a9d7ff",
+    "#ffd29a"
+  ],
+  "lines": [
+    {
+      "text": "Screenshot quality review",
+      "x": 24,
+      "y": 35
+    },
+    {
+      "text": "Invoice number 48271",
+      "x": 24,
+      "y": 75
+    },
+    {
+      "text": "Order total 125.50 USD",
+      "x": 24,
+      "y": 115
+    },
+    {
+      "text": "Contact support@example.com",
+      "x": 24,
+      "y": 155
+    },
+    {
+      "text": "Keep every original screenshot",
+      "x": 24,
+      "y": 195
+    },
+    {
+      "text": "Search, select and copy this text",
+      "x": 24,
+      "y": 235
+    }
+  ],
+  "language": "eng",
+  "provenance": "Chromium canvas, Arial; exact source strings; top-left line positions; no OCR-derived ground truth"
+}

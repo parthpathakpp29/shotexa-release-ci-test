@@ -24,8 +24,8 @@
  *              anything learned from data. It is NOT "AI" and it is not a similarity score.
  *
  * Optional, all off by default so the first answer a user sees is the conservative one:
- *   - ignore anti-aliasing: a changed pixel whose colour simply moved to a neighbouring
- *     pixel in the other screenshot (sub-pixel shift) is dropped.
+ *   - ignore anti-aliasing: small shade variations between stable edge neighbours
+ *     may be omitted; whole-pixel movement remains a difference.
  *   - ignore near-identical colour: drop changes under the just-noticeable difference.
  *   - ignore transparent pixels / compare alpha / ignore one chosen colour.
  */
@@ -71,7 +71,7 @@ export function differenceStats(changedPixels: number, totalPixels: number, comp
   const compared = Math.min(total, Math.max(0, Math.round(comparedPixels ?? total)));
   const changed = Math.min(compared, Math.max(0, Math.round(changedPixels)));
   const changedPercent = compared === 0 ? 0 : (changed / compared) * 100;
-  return { changedPixels: changed, totalPixels: total, changedPercent, unchangedPercent: 100 - changedPercent };
+  return { changedPixels: changed, totalPixels: total, changedPercent, unchangedPercent: compared === 0 ? 0 : 100 - changedPercent };
 }
 
 /** The same numbers plus what was left out, for the comparison summary and the report. */
@@ -263,11 +263,12 @@ export function compareBuffers(
       isChanged = channel > limit || lumDiff > lumLimit;
       normalised = clamp01((Math.max(channel, lumDiff) - limit) / Math.max(1, 255 - limit));
     }
-    if (d.compareAlpha && Math.abs(a[i + 3] - b[i + 3]) > limit) {
+    const alphaChanged = d.compareAlpha && Math.abs(a[i + 3] - b[i + 3]) > limit;
+    if (alphaChanged) {
       isChanged = true;
       normalised = Math.max(normalised, clamp01((Math.abs(a[i + 3] - b[i + 3]) - limit) / Math.max(1, 255 - limit)));
     }
-    if (isChanged && d.ignoreNearIdenticalColour && d.metric !== "perceptual") {
+    if (isChanged && !alphaChanged && d.ignoreNearIdenticalColour && d.metric !== "perceptual") {
       const dE = deltaE76(Math.round(ca[0]), Math.round(ca[1]), Math.round(ca[2]), Math.round(cb[0]), Math.round(cb[1]), Math.round(cb[2]));
       if (dE <= JND_DELTA_E) isChanged = false;
     }
@@ -279,7 +280,7 @@ export function compareBuffers(
   }
 
   if (d.ignoreAntialiasing && changed > 0) {
-    changed -= dropAntialiasing(a, b, mask, strength, width, height, Math.max(limit, 8), composite);
+    changed -= dropAntialiasing(a, b, mask, strength, width, height, Math.max(limit, 8), composite, d.compareAlpha ? limit : null);
   }
 
   // Finally paint the picture the user sees. Preview and export run exactly this code.
@@ -333,9 +334,9 @@ export function compareBuffers(
 }
 
 /**
- * Anti-aliasing / sub-pixel guard. A changed pixel is dropped when the colour it has in
- * "before" also appears next to it in "after", AND the colour it has in "after" also appears
- * next to it in "before" — i.e. the colour moved by less than a pixel instead of changing.
+ * Optional conservative edge-shade guard. Only a small shade variation between
+ * unchanged darker AND lighter neighbours is eligible. Whole-pixel movement,
+ * flat colour changes and explicitly compared alpha changes remain visible.
  * Returns how many pixels were dropped.
  */
 function dropAntialiasing(
@@ -347,6 +348,7 @@ function dropAntialiasing(
   height: number,
   tolerance: number,
   composite: (buffer: Uint8ClampedArray, index: number, out: number[]) => void,
+  alphaTolerance: number | null,
 ): number {
   const ca = [0, 0, 0];
   const cb = [0, 0, 0];
@@ -357,28 +359,34 @@ function dropAntialiasing(
     for (let x = 0; x < width; x++) {
       const p = y * width + x;
       if (!mask[p]) continue;
+      if (alphaTolerance !== null && Math.abs(a[p * 4 + 3] - b[p * 4 + 3]) > alphaTolerance) continue;
       composite(a, p * 4, ca);
       composite(b, p * 4, cb);
-      let beforeFoundInAfter = false;
-      let afterFoundInBefore = false;
-      for (let dy = -1; dy <= 1 && !(beforeFoundInAfter && afterFoundInBefore); dy++) {
+      // A whole-pixel edge/colour change is genuine, even when the same colours
+      // occur next door. Only small edge-shade variations qualify as noise.
+      if (!near(ca, cb)) continue;
+      let darker = false;
+      let lighter = false;
+      const low = Math.min(luma(ca[0], ca[1], ca[2]), luma(cb[0], cb[1], cb[2]));
+      const high = Math.max(luma(ca[0], ca[1], ca[2]), luma(cb[0], cb[1], cb[2]));
+      const other = [0, 0, 0];
+      for (let dy = -1; dy <= 1 && !(darker && lighter); dy++) {
         for (let dx = -1; dx <= 1; dx++) {
           if (dx === 0 && dy === 0) continue;
           const nx = x + dx;
           const ny = y + dy;
           if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
           const q = (ny * width + nx) * 4;
-          if (!beforeFoundInAfter) {
-            composite(b, q, n);
-            if (near(ca, n)) beforeFoundInAfter = true;
-          }
-          if (!afterFoundInBefore) {
-            composite(a, q, n);
-            if (near(cb, n)) afterFoundInBefore = true;
-          }
+          composite(a, q, n);
+          composite(b, q, other);
+          if (!near(n, other)) continue;
+          const na = luma(n[0], n[1], n[2]);
+          const nb = luma(other[0], other[1], other[2]);
+          if (Math.max(na, nb) < low - tolerance) darker = true;
+          if (Math.min(na, nb) > high + tolerance) lighter = true;
         }
       }
-      if (beforeFoundInAfter && afterFoundInBefore) drop.push(p);
+      if (darker && lighter) drop.push(p);
     }
   }
   for (const p of drop) {

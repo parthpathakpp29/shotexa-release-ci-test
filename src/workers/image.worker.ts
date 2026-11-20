@@ -4,8 +4,10 @@
  * No OpenCV and no OCR engine here.
  */
 import { MetadataError } from "@/core/metadata/errors";
+import { createBoundedPreview, PreviewError } from "@/core/image/preview";
 import { runMetadataClean, runMetadataInspect } from "@/core/metadata/run";
 import { PrepareError, prepareForOcr } from "@/core/ocr/prepare-image";
+import { applyPreprocessing, imageStats } from "@/core/ocr/preprocess";
 import { renderSafeShare } from "@/core/redaction/render";
 import { RedactionError } from "@/core/redaction/types";
 import { composeChain } from "@/core/stitch/compose-chain";
@@ -37,19 +39,7 @@ serveWorker(
       const blob = await composeStitch(a, b, plan, { type, quality, signal: ctx.signal });
       return { blob, ms: Math.round(performance.now() - t) };
     },
-    "image.preview": async ({ image, maxWidth, maxPixels }) => {
-      const full = await createImageBitmap(image).catch(() => {
-        throw new StitchError("DECODE_FAILED");
-      });
-      const { width, height } = full;
-      const scale = Math.min(1, maxWidth / width, Math.sqrt(maxPixels / (width * height)));
-      try {
-        const bitmap = await createImageBitmap(full, { resizeWidth: Math.max(1, Math.round(width * scale)), resizeHeight: Math.max(1, Math.round(height * scale)), resizeQuality: "high" });
-        return { bitmap, width, height };
-      } finally {
-        full.close();
-      }
-    },
+    "image.preview": async ({ image, ...options }, ctx) => createBoundedPreview(image, { ...options, signal: ctx.signal }),
     "stitch.composeChain": async ({ images, plan, sources, format, quality }, ctx) =>
       composeChain(images, plan, { format, quality, sources, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "compose") }),
     "combine.compose": async ({ images, plan, format, quality }, ctx) =>
@@ -60,10 +50,10 @@ serveWorker(
       renderAnnotated(image, transform, annotations, { source, format, quality, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "render") }),
     "split.export": async ({ image, pieces, source, format, quality }, ctx) =>
       renderSplit(image, pieces, { source, format, quality, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "render") }),
-    "image.encode": async ({ image, source, format, quality, background, probe, targetBytes }, ctx) =>
-      encodeImage(image, { source, format, quality, background, probe, targetBytes, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "encode") }),
-    "image.compareFormats": async ({ image, source, quality, background }, ctx) =>
-      compareFormats(image, { source, quality, background, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "compare formats") }),
+    "image.encode": async ({ image, source, format, quality, background, probe, targetBytes, resizePercent }, ctx) =>
+      encodeImage(image, { source, format, quality, background, probe, targetBytes, resizePercent, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "encode") }),
+    "image.compareFormats": async ({ image, source, quality, background, resizePercent, existing }, ctx) =>
+      compareFormats(image, { source, quality, background, resizePercent, existing, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "compare formats") }),
     "beautify.export": async ({ image, settings, source, resources, format, quality }, ctx) =>
       renderBeautified(image, settings, { source, resources, format, quality, signal: ctx.signal, onProgress: (p) => ctx.progress(p, "compose") }),
     "compare.export": async ({ imageA, imageB, settings, a, b, alignment, format, quality }, ctx) =>
@@ -72,9 +62,12 @@ serveWorker(
     "metadata.clean": async ({ image, name, type, policy }) => runMetadataClean(image, name, type, policy),
     "redaction.export": async ({ image, operations, format, quality }, ctx) =>
       renderSafeShare(image, operations, { format, quality, signal: ctx.signal, onProgress: (progress, stage) => ctx.progress(progress, stage) }),
-    "ocr.prepare": async ({ image, steps, strips }, ctx) => prepareForOcr(image, steps, strips, ctx.signal),
+    "ocr.prepare": async ({ image, steps, strips, budgetBytes, stripPolicy }, ctx) => prepareForOcr(image, steps, strips, ctx.signal, { budgetBytes, stripPolicy }),
+    "ocr.stats": async (pixels) => imageStats(pixels),
+    "ocr.preprocess": async ({ pixels, steps }) => applyPreprocessing(pixels, steps),
   },
   (err): WorkerErrorCode => {
+    if (err instanceof PreviewError) return err.code;
     if (err instanceof StitchError) return err.code;
     if (err instanceof CombineError) return err.code;
     if (err instanceof EditorError) return err.code;

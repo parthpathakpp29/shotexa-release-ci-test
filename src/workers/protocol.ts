@@ -9,7 +9,7 @@ import type { CombineErrorCode } from "@/core/combine/errors";
 import type { EditorErrorCode, ImageTransform, TransformExportResult } from "@/core/image-transform/types";
 import type { AnnotationErrorCode, AnnotationObject } from "@/core/annotation/types";
 import type { SplitErrorCode, SplitExportResult, SplitPiece } from "@/core/split/types";
-import type { EncodeErrorCode, EncodeResult, FormatComparisonResult } from "@/core/image-encode/types";
+import type { EncodeErrorCode, EncodeResult, FormatCandidate, FormatComparisonResult } from "@/core/image-encode/types";
 import type { BeautifyErrorCode, BeautifySettings } from "@/core/beautify/types";
 import type { BeautifyRenderResult } from "@/core/beautify/render";
 import type { CompareAlignEstimate, CompareErrorCode, CompareSettings } from "@/core/compare/types";
@@ -46,9 +46,9 @@ export interface WorkerOps {
     input: { image: Blob; source: { width: number; height: number }; mask: { data: Uint8ClampedArray; width: number; height: number; matte?: import("@/core/background-removal/types").InkMatte }; settings: BackgroundRemovalSettings; format: "png" | "jpeg" | "webp"; quality?: number; backgroundImage?: Blob };
     output: BackgroundRemovalRenderResult;
   };
-  /** Downscaled preview (full decode happens here, off the main thread); bitmap is transferred. */
+  /** Bounded Blob preview decode; original dimensions are retained and bitmap is transferred. */
   "image.preview": {
-    input: { image: Blob; maxWidth: number; maxPixels: number };
+    input: { image: Blob; maxWidth: number; maxPixels: number; maxHeight?: number; budgetBytes?: number };
     output: { bitmap: ImageBitmap; width: number; height: number };
   };
   /** Full-resolution N-screenshot stitch export (single canvas or tiled/streamed PNG). */
@@ -86,14 +86,14 @@ export interface WorkerOps {
     input: { image: Blob; pieces: SplitPiece[]; source: { width: number; height: number }; format: "png" | "jpeg" | "webp"; quality?: number };
     output: SplitExportResult;
   };
-  /** Compress / Convert: decode once, re-encode at the same size (JPEG on a chosen background), verify. */
+  /** Compress / Convert: decode once, re-encode at original or explicitly reduced dimensions, verify. */
   "image.encode": {
-    input: { image: Blob; source: { width: number; height: number }; format: "png" | "jpeg" | "webp"; quality: number; background: string; probe?: { format: "png" | "jpeg" | "webp"; quality: number }; targetBytes?: number | null };
+    input: { image: Blob; source: { width: number; height: number }; format: "png" | "jpeg" | "webp"; quality: number; background: string; probe?: { format: "png" | "jpeg" | "webp"; quality: number }; targetBytes?: number | null; resizePercent?: number };
     output: EncodeResult;
   };
-  /** Convert: bounded PNG/JPEG/WebP measurement from one decode, sequentially rendered. */
+  /** Compress / Convert: bounded PNG/JPEG/WebP measurement from one decode, sequentially rendered. */
   "image.compareFormats": {
-    input: { image: Blob; source: { width: number; height: number }; quality: number; background: string };
+    input: { image: Blob; source: { width: number; height: number }; quality: number; background: string; resizePercent?: number; existing?: FormatCandidate[] };
     output: FormatComparisonResult;
   };
   /** Beautifier: decode once, compose background/frame/screenshot at full size, encode, verify. */
@@ -129,9 +129,11 @@ export interface WorkerOps {
    * Optional strips (long screenshots) are cut from ONE decode. `steps: "auto"` = default policy.
    */
   "ocr.prepare": {
-    input: { image: Blob; steps: PreprocessStep[] | "auto"; strips?: { y: number; height: number }[] };
+    input: { image: Blob; steps: PreprocessStep[] | "auto"; strips?: { y: number; height: number }[]; budgetBytes?: number; stripPolicy?: import("@/core/ocr/prepare-image").OcrStripPolicy };
     output: PreparedImage;
   };
+  "ocr.stats": { input: import("@/core/ocr/preprocess").Rgba; output: import("@/core/ocr/preprocess").ImageStats };
+  "ocr.preprocess": { input: { pixels: import("@/core/ocr/preprocess").Rgba; steps: PreprocessStep[] }; output: import("@/core/ocr/preprocess").PreprocessOutput };
   /** Decode each screenshot once → proxy → row signals (pagination runs on these). */
   "pdf.analyse": {
     input: { images: Blob[]; config?: PaginationConfigOverrides };
@@ -159,7 +161,7 @@ export type WorkerRequest =
   | ({ [K in OpName]: Envelope & { type: "RUN"; op: K; input: WorkerOps[K]["input"] } }[OpName])
   | (Envelope & { type: "CANCEL" });
 
-export type WorkerErrorCode = StitchErrorCode | CombineErrorCode | EditorErrorCode | AnnotationErrorCode | SplitErrorCode | EncodeErrorCode | BeautifyErrorCode | CompareErrorCode | RedactionErrorCode | BackgroundRemovalErrorCode | "FACE_DETECTION_FAILED" | "UNKNOWN_OP" | "PROTOCOL_MISMATCH" | "COMPOSE_FAILED" | "MEMORY_PRESSURE" | "OCR_DECODE_FAILED" | "OCR_OUT_OF_MEMORY" | PdfErrorCode | MetadataErrorCode;
+export type WorkerErrorCode = StitchErrorCode | CombineErrorCode | EditorErrorCode | AnnotationErrorCode | SplitErrorCode | EncodeErrorCode | BeautifyErrorCode | CompareErrorCode | RedactionErrorCode | BackgroundRemovalErrorCode | "PREVIEW_TOO_LARGE" | "PREVIEW_MEMORY_PRESSURE" | "UNSUPPORTED" | "FACE_DETECTION_FAILED" | "UNKNOWN_OP" | "PROTOCOL_MISMATCH" | "COMPOSE_FAILED" | "MEMORY_PRESSURE" | "OCR_DECODE_FAILED" | "OCR_OUT_OF_MEMORY" | PdfErrorCode | MetadataErrorCode;
 
 export type WorkerResponse =
   | (Envelope & { type: "PROGRESS"; progress: number; stage?: string })
@@ -207,7 +209,13 @@ export function serveWorker(
         signal,
         progress: (progress, stage) => scope.postMessage({ ...base, type: "PROGRESS", progress, stage }),
       });
-      if (signal.aborted) scope.postMessage({ ...base, type: "CANCELLED" });
+      if (signal.aborted) {
+        // Cancelled transferable outputs never reach the registry: release their native memory.
+        for (const resource of transferOf?.(msg.op, output) ?? []) {
+          if ("close" in resource && typeof resource.close === "function") resource.close();
+        }
+        scope.postMessage({ ...base, type: "CANCELLED" });
+      }
       else scope.postMessage({ ...base, type: "SUCCESS", output }, transferOf?.(msg.op, output) ?? []);
     } catch (err) {
       const code = toCode(err);

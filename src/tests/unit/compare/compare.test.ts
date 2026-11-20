@@ -176,7 +176,7 @@ describe("pixel difference", () => {
   it("reports changed and unchanged preview percentages from measured pixels", () => {
     expect(differenceStats(38, 100)).toEqual({ changedPixels: 38, totalPixels: 100, changedPercent: 38, unchangedPercent: 62 });
     expect(differenceStats(999, 5)).toEqual({ changedPixels: 5, totalPixels: 5, changedPercent: 100, unchangedPercent: 0 });
-    expect(differenceStats(-1, 0)).toEqual({ changedPixels: 0, totalPixels: 0, changedPercent: 0, unchangedPercent: 100 });
+    expect(differenceStats(-1, 0)).toEqual({ changedPixels: 0, totalPixels: 0, changedPercent: 0, unchangedPercent: 0 });
   });
 
   /** A tiny RGBA buffer helper: `fill` decides each pixel. */

@@ -8,6 +8,7 @@
  */
 import type { CompareAlignEstimate, CompareRegion, CompareSettings, CompareTextDiff, CompareVisualAnalysis } from "./types";
 import { regionLabel } from "./analysis";
+import { appliedAlignment } from "./layout";
 
 export const COMPARE_SUMMARY_SCHEMA = "shotexa.compare.summary";
 export const COMPARE_SUMMARY_VERSION = 1;
@@ -61,7 +62,9 @@ export interface CompareSummary {
     luminanceTolerance: number;
     deltaE: number;
   };
-  analysis: { width: number; height: number; pixelsPerAnalysisPixel: number } | null;
+  analysis: { width: number; height: number; pixelsPerAnalysisPixel: number; sourceScale?: number } | null;
+  measurement: "not-measured" | "excluded" | "measured";
+  warnings: string[];
   totals: {
     changedPercent: number;
     unchangedPercent: number;
@@ -134,6 +137,14 @@ const METRIC_DESCRIPTION = {
 export function buildCompareSummary(input: CompareSummaryInput): CompareSummary {
   const { a, b, settings, analysis, textDiff } = input;
   const alignment = input.alignment;
+  const applied = appliedAlignment(settings, alignment);
+  const measurement = !analysis ? "not-measured" : analysis.comparedPixels === 0 ? "excluded" : "measured";
+  const warnings: string[] = [];
+  if (!analysis) warnings.push("Visual difference has not been measured.");
+  else if (analysis.comparedPixels === 0) warnings.push("No pixels were compared. Review ignore regions, transparency and colour exclusions.");
+  if (analysis && (analysis.analysisScale > 1 || (analysis.sourceScale ?? 1) < 1)) warnings.push("Measured from reduced previews; small text and one-pixel changes may be missed. Inspect the original-size export.");
+  if (settings.diff.ignoreAntialiasing) warnings.push("Antialiasing filtering is a heuristic and may omit small edge-shade changes.");
+  if (settings.fit === "cover") warnings.push("Fill fitting crops content outside the comparison frame.");
   const mismatches: string[] = [];
   if (a.width !== b.width) mismatches.push(`Width differs: ${a.width} px and ${b.width} px`);
   if (a.height !== b.height) mismatches.push(`Height differs: ${a.height} px and ${b.height} px`);
@@ -158,10 +169,10 @@ export function buildCompareSummary(input: CompareSummaryInput): CompareSummary 
     },
     alignment: {
       mode: settings.alignment.mode,
-      status: alignment?.status ?? (settings.alignment.mode === "off" ? "off" : "failed"),
-      x: round(alignment?.dx ?? 0, 2),
-      y: round(alignment?.dy ?? 0, 2),
-      scalePercent: round((alignment?.scale ?? 1) * 100, 2),
+      status: settings.alignment.mode === "off" ? "off" : alignment?.status ?? "failed",
+      x: round(applied.dx, 2),
+      y: round(applied.dy, 2),
+      scalePercent: round(applied.scale * 100, 2),
       score: round(alignment?.score ?? 0, 3),
       confidence: alignment?.confidence ?? "low",
       method: alignment?.method ?? settings.alignment.mode,
@@ -173,7 +184,9 @@ export function buildCompareSummary(input: CompareSummaryInput): CompareSummary 
       luminanceTolerance: settings.diff.luminanceTolerance,
       deltaE: settings.diff.deltaE,
     },
-    analysis: analysis ? { width: analysis.width, height: analysis.height, pixelsPerAnalysisPixel: round(analysis.analysisScale, 4) } : null,
+    analysis: analysis ? { width: analysis.width, height: analysis.height, pixelsPerAnalysisPixel: round(analysis.analysisScale, 4), ...(analysis.sourceScale !== undefined ? { sourceScale: round(analysis.sourceScale, 4) } : {}) } : null,
+    measurement,
+    warnings,
     totals: {
       changedPercent: round(analysis?.changedPercent ?? 0, 2),
       unchangedPercent: round(analysis?.unchangedPercent ?? 0, 2),
@@ -250,10 +263,11 @@ export function summaryToJson(summary: CompareSummary): string {
 
 /** The short label/value list the summary panel and the PDF share, in one place. */
 export function summaryRows(summary: CompareSummary): { label: string; value: string }[] {
+  const unavailable = summary.measurement === "not-measured" ? "Not measured" : summary.measurement === "excluded" ? "No compared pixels" : null;
   const rows = [
-    { label: "Changed pixels", value: `${summary.totals.changedPercent.toFixed(1)}%` },
-    { label: "Unchanged", value: `${summary.totals.unchangedPercent.toFixed(1)}%` },
-    { label: "Changed regions", value: `${summary.totals.changedRegions}${summary.totals.regionsTruncated ? "+" : ""}` },
+    { label: "Changed pixels", value: unavailable ?? `${summary.totals.changedPercent.toFixed(1)}%` },
+    { label: "Unchanged", value: unavailable ?? `${summary.totals.unchangedPercent.toFixed(1)}%` },
+    { label: "Changed regions", value: unavailable ?? `${summary.totals.changedRegions}${summary.totals.regionsTruncated ? "+" : ""}` },
   ];
   if (summary.totals.textChanges > 0 || summary.totals.textAdded + summary.totals.textRemoved + summary.totals.textModified > 0) {
     rows.push(

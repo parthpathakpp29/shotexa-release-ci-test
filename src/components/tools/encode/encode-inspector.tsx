@@ -13,12 +13,13 @@ import { BACKGROUND_PRESETS, DEFAULT_ENCODE_SETTINGS, TARGET_SIZE_PRESETS } from
 import { formatAdvice } from "@/core/image-encode/compare";
 import type { EncodeTool } from "@/core/image-encode/types";
 import { cn } from "@/lib/cn";
+import { encodeSize, resizePercent } from "@/core/image-encode/geometry";
 
 export function issueText(issue: ReturnType<typeof encodeIssue>, format: OutputFormat): string | null {
   if (!issue) return null;
   if (issue === "format-dimension") return `${FORMAT_LABEL[format]} holds at most ${formatMaxSide(format).toLocaleString()} px per side. Choose PNG, or split the image first.`;
-  if (issue === "source-too-large") return "This image is too large to re-encode in a browser. Split it first.";
-  return `This image is too large to encode as ${FORMAT_LABEL[format]} in a browser. Choose PNG, or split it first.`;
+  if (issue === "source-too-large") return "This original is too large to decode safely within the browser memory budget. Choose a smaller source file.";
+  return `This image is too large to encode as ${FORMAT_LABEL[format]} at these dimensions. Choose smaller dimensions, PNG, or split it first.`;
 }
 
 export function EncodeInspector({ tool, assetId, format, busy, outputName, onOutputName, onRun, presetFormat }: { tool: EncodeTool; assetId: string; format: OutputFormat; busy: boolean; outputName?: string; onOutputName?(value: string): void; onRun(): void; presetFormat?: OutputFormat }) {
@@ -43,14 +44,16 @@ export function EncodeInspector({ tool, assetId, format, busy, outputName, onOut
   if (!file) return null;
   const hasAlpha = transparent?.id === assetId ? transparent.value : null;
   const advisor = tool === "convert" ? formatAdvice({ source: input, target: format, hasTransparency: hasAlpha }) : null;
-  const issue = encodeIssue(file, format);
+  const percent = tool === "compress" ? resizePercent(settings.resizePercent) : 100;
+  const dimensions = encodeSize(file, percent);
+  const issue = encodeIssue(file, format, typeof CompressionStream !== "undefined", percent);
   // Explicit same-format Convert is useful after measuring candidates; Auto still changes format.
   const choices = OUTPUT_FORMATS;
   const custom = !BACKGROUND_PRESETS.some((p) => p.value === settings.background);
 
   return (
     <div data-testid="encode-inspector">
-      <InspectorSection title="Output format" action={<button type="button" onClick={() => setSettings(tool, { ...DEFAULT_ENCODE_SETTINGS[tool], ...(presetFormat ? { format: presetFormat } : {}) })} className="inline-flex min-h-9 items-center gap-1 text-xs font-medium text-ink-2 hover:text-ink max-md:min-h-11"><RotateCcw className="size-3.5" /> Reset settings</button>}>
+      <InspectorSection title="Output format" action={<button type="button" onClick={() => setSettings(tool, { ...DEFAULT_ENCODE_SETTINGS[tool], ...(tool === "compress" ? { resizePercent: 100 } : {}), ...(presetFormat ? { format: presetFormat } : {}) })} className="inline-flex min-h-9 items-center gap-1 text-xs font-medium text-ink-2 hover:text-ink max-md:min-h-11"><RotateCcw className="size-3.5" /> Reset settings</button>}>
         <SegmentedControl<OutputFormat>
           label="Output format"
           value={format}
@@ -70,7 +73,7 @@ export function EncodeInspector({ tool, assetId, format, busy, outputName, onOut
           }))}
         />
         <p className="t-body-sm mt-3 text-ink-3">
-          {tool === "compress" && format === input ? "Same format as the original." : `${FORMAT_LABEL[input]} → ${FORMAT_LABEL[format]}.`} Pixel size stays {file.width} × {file.height}.
+          {tool === "compress" && format === input ? "Same format as the original." : `${FORMAT_LABEL[input]} → ${FORMAT_LABEL[format]}.`} {percent === 100 ? `Pixel size stays ${file.width} × ${file.height}.` : `Your chosen output is ${dimensions.width} × ${dimensions.height} (${percent}% of each dimension).`}
         </p>
         {issue && (
           <p role="alert" className="t-body-sm mt-2 text-error" data-testid="encode-issue">
@@ -78,6 +81,7 @@ export function EncodeInspector({ tool, assetId, format, busy, outputName, onOut
           </p>
         )}
       </InspectorSection>
+      {tool === "compress" && <InspectorSection title="Size, format and detail"><p className="t-body-sm text-ink-2">Lower JPEG/WebP quality usually reduces bytes and can soften text. PNG keeps the decoded pixels at original size. Smaller dimensions remove pixels in every format.</p><p className="t-body-sm mt-2 text-ink-3">Check the measured size and inspect the actual result at 100%. No format or dimension changes automatically.</p></InspectorSection>}
 
       {advisor && (
         <InspectorSection title="Which format should I use?">
@@ -90,16 +94,29 @@ export function EncodeInspector({ tool, assetId, format, busy, outputName, onOut
       <InspectorSection title="Quality">
         {supportsQuality(format) ? (
           <>
-            <FieldLabel value={<span data-testid="encode-quality-value">{Math.round(settings.quality * 100)}%</span>}>{FORMAT_LABEL[format]} quality</FieldLabel>
+            <FieldLabel value={<span data-testid="encode-quality-value">{Math.round(settings.quality * 100)}%</span>}>{FORMAT_LABEL[format]} {tool === "compress" && settings.targetBytes ? "maximum quality" : "quality"}</FieldLabel>
             <Slider label={`${FORMAT_LABEL[format]} quality`} value={Math.round(settings.quality * 100)} min={50} max={100} onChange={(v) => setSettings(tool, { quality: v / 100 })} valueText={`${Math.round(settings.quality * 100)}%`} />
             <p className="t-body-sm mt-2 text-ink-3">Lower quality can soften text and introduce artifacts. Compare at 100% zoom; use PNG when small text needs lossless output.</p>
           </>
         ) : (
           <p className="t-body-sm text-ink-2" data-testid="encode-png-note">
-            PNG is lossless: every pixel is kept exactly and there is no quality setting. The size depends on the image itself — choose JPEG or WebP to trade quality for a smaller file.
+            {percent === 100 ? "PNG is lossless: every pixel is kept exactly and there is no quality setting. The size depends on the image itself — measure other formats to compare their size and detail." : "PNG encodes the resized pixels losslessly. Resizing changes pixel values and dimensions; there is no PNG quality slider."}
           </p>
         )}
       </InspectorSection>
+
+      {tool === "compress" && (
+        <InspectorSection title="Image dimensions">
+          <label className="flex min-h-11 items-center gap-3 text-sm">
+            <input type="checkbox" checked={percent !== 100} onChange={(event) => setSettings(tool, { resizePercent: event.target.checked ? 75 : 100 })} /> Resize image
+          </label>
+          {percent !== 100 && <div className="mt-3">
+            <NumberField label="Scale" ariaLabel="Resize percentage" testId="compressor-resize-percent" value={percent} min={10} max={100} unit="%" onCommit={(value) => setSettings(tool, { resizePercent: value })} />
+            <p className="mt-2 text-xs text-ink-2" data-testid="compressor-dimensions">Output {dimensions.width} × {dimensions.height} px · original {file.width} × {file.height} px</p>
+          </div>}
+          <p className="t-body-sm mt-2 text-ink-3">Optional downscaling keeps the aspect ratio. Text and fine details can become smaller. Your source file is unchanged.</p>
+        </InspectorSection>
+      )}
 
       {tool === "compress" && (
         <InspectorSection title="Target file size">
@@ -114,7 +131,7 @@ export function EncodeInspector({ tool, assetId, format, busy, outputName, onOut
               <div className="mt-3">
                 <NumberField label="Custom target" ariaLabel="Custom target in KB" testId="encode-target-custom" value={Math.max(1, Math.round((settings.targetBytes ?? 500 * 1024) / 1024))} min={1} max={1024 * 1024} unit="KB" onCommit={(kb) => setSettings(tool, { targetBytes: kb * 1024 })} />
               </div>
-              <p className="t-body-sm mt-3 text-ink-3">Shotexa makes up to seven local JPEG/WebP encodes to find the highest measured quality at or below this target. It never resizes or changes the format. If 50% is still larger, it reports the closest result.</p>
+              <p className="t-body-sm mt-3 text-ink-3">Searches up to seven quality settings, from 50% to your selected maximum, at {dimensions.width} × {dimensions.height}. The smallest measured result is shown if the target cannot be reached. Resizing and format changes require your choice. 1 KB = 1,024 bytes.</p>
             </>
           ) : (
             <p className="t-body-sm text-ink-2">PNG is lossless and has no quality setting, so it cannot honestly target an exact file size. Choose JPEG or WebP to use a target.</p>

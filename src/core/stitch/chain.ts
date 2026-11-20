@@ -36,17 +36,23 @@ export function planStitchChain(dims: ImageDims[], joins: ChainJoin[]): ChainPla
     tops.push(tops[i] + p.offsetY);
     seams.push(tops[i] + p.seamY);
   }
-  const segments: ComposePlan["segments"] = [];
-  let start = 0;
-  for (let i = 0; i < dims.length; i++) {
+  let segments: ComposePlan["segments"] = [{ source: 0, sy: 0, height: dims[0].height, dy: 0 }];
+  for (let i = 1; i < dims.length; i++) {
+    const start = Math.max(tops[i], seams[i - 1]);
     const bottom = tops[i] + dims[i].height;
-    // A later seam can't precede an earlier one (tiny screenshots / extreme manual offsets):
-    // clamp into [start, bottom] so rows stay contiguous and each comes from one source.
-    const end = i < seams.length ? Math.min(bottom, Math.max(start, seams[i])) : bottom;
-    if (i < seams.length) seams[i] = end;
-    if (end > start) segments.push({ source: i, sy: start - tops[i], height: end - start, dy: start });
-    start = Math.max(start, end);
-    if (i + 1 < dims.length && start < tops[i + 1]) start = tops[i + 1]; // never read above a screenshot's row 0
+    if (bottom <= start) continue;
+    // Replace only the rows covered by this screenshot. Keep earlier tails when a
+    // short screenshot is contained; a later source cannot shorten the output.
+    segments = segments.flatMap(s => {
+      const end = s.dy + s.height;
+      if (end <= start || s.dy >= bottom) return [s];
+      return [
+        ...(s.dy < start ? [{ ...s, height: start - s.dy }] : []),
+        ...(end > bottom ? [{ ...s, sy: s.sy + bottom - s.dy, dy: bottom, height: end - bottom }] : []),
+      ];
+    });
+    segments.push({ source: i, sy: start - tops[i], height: bottom - start, dy: start });
+    segments.sort((a, b) => a.dy - b.dy);
   }
   const height = segments.length ? Math.max(...segments.map((s) => s.dy + s.height)) : 0;
   return { width: Math.max(...dims.map((d) => d.width)), height, segments, tops, seams };

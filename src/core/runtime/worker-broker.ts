@@ -35,9 +35,12 @@ export class WorkerBroker {
     return c.run(op, input, opts);
   }
 
-  /** Refuse new jobs (page being left); `resume` after a back/forward-cache restore. */
+  /** Stop active and queued worker loads while leaving; recreate lazily after restore. */
   suspend(): void {
     this.#suspended = true;
+    // A CANCEL message cannot interrupt script loading, Blob reads or native bitmap decoding.
+    // Terminate before the document stops its loads, rather than leaving those tasks alive.
+    this.dispose();
   }
 
   resume(): void {

@@ -12,7 +12,7 @@ import { createCompareReportPdf, createCompareReportZip } from "@/core/compare/r
 import { buildCompareSummary, COMPARE_SUMMARY_SCHEMA, COMPARE_SUMMARY_VERSION, summaryRows, summaryToJson, type CompareSummaryInput } from "@/core/compare/summary";
 import type { CompareSettings, CompareTextDiff, CompareVisualAnalysis } from "@/core/compare/types";
 
-const settings = (over: Partial<CompareSettings> = {}): CompareSettings => ({ ...DEFAULT_COMPARE, a: "a", b: "b", mode: "difference", ...over });
+const settings = (over: Partial<CompareSettings> = {}): CompareSettings => ({ ...DEFAULT_COMPARE, a: "a", b: "b", mode: "difference", alignment: { mode: "translate-scale", dx: 0, dy: 0, scale: 1 }, ...over });
 
 const analysis = (over: Partial<CompareVisualAnalysis> = {}): CompareVisualAnalysis => ({
   changedPixels: 7800,

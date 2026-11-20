@@ -19,6 +19,7 @@ import { downloadAsset } from "@/core/runtime/runtime";
 import { pairKey } from "@/core/runtime/store";
 import type { StitchPair } from "@/core/runtime/types";
 import { planStitchChain } from "@/core/stitch/chain";
+import { chooseOutputStrategy } from "@/core/image/output-strategy";
 import { offsetRange } from "@/core/stitch/plan";
 import type { ViewportZoom } from "@/core/viewport/viewport";
 import { cn } from "@/lib/cn";
@@ -40,6 +41,7 @@ type Summary = { tone: "accent" | "warning" | "neutral" | "error"; label: string
 
 function summarise(pairs: (StitchPair | undefined)[]): Summary | null {
   if (!pairs.length || pairs.some((p) => !p || p.status === "pending" || p.status === "analysing")) return null;
+  if (pairs.some(p => p?.error === "CANCELLED")) return { tone: "neutral", label: "Alignment cancelled", detail: "Find the overlap again when ready" };
   if (pairs.some((p) => p!.status === "failed")) return { tone: "error", label: "Couldn’t align", detail: "See the note below" };
   if (pairs.some((p) => p!.offset !== p!.autoOffset)) return { tone: "neutral", label: "Adjusted manually", detail: "Review the seam before exporting" };
   if (pairs.some((p) => !p!.matched)) return { tone: "warning", label: "No overlap found", detail: "Placed one after another" };
@@ -53,6 +55,7 @@ function StitchWorkspace() {
   const files = useWorkspace((s) => s.files);
   const pairMap = useWorkspace((s) => s.stitch.pairs);
   const { viewMode, activeJoin } = useWorkspace((s) => s.stitch);
+  const exportSettings = useWorkspace(s => s.exportSettings);
   const setPairOffset = useWorkspace((s) => s.setPairOffset);
   const setActiveJoin = useWorkspace((s) => s.setActiveJoin);
   const setPair = useWorkspace((s) => s.setPair);
@@ -78,6 +81,7 @@ function StitchWorkspace() {
   // Analyse every adjacent pair that has no result yet (first run lazily loads the engine).
   useEffect(() => {
     if (joinSig) void runtime.analyseStitch();
+    return () => runtime.cancelStitch();
   }, [runtime, joinSig]);
 
   const plan = useMemo(() => {
@@ -125,6 +129,8 @@ function StitchWorkspace() {
   });
 
   const [exportError, setExportError] = useState<string | null>(null);
+  const exportDecision = plan ? chooseOutputStrategy({ width: plan.width, height: plan.height, format: exportSettings.format, largestSourceBytes: Math.max(0, ...originals.map(f => f.width * f.height * 4)) }, { offscreenCanvas: true, compressionStream: runtime.caps.compressionStream }) : null;
+  const exportBlocked = exportDecision?.strategy.kind === "split" || exportDecision?.strategy.kind === "reduce-or-split";
   const exporting = !!exportJob;
   const doExport = async () => {
     setExportError(null);
@@ -132,12 +138,13 @@ function StitchWorkspace() {
       const r = await runtime.exportStitch();
       downloadAsset(runtime, r.id);
     } catch (e) {
-      setExportError((e as { code?: string }).code ?? "INTERNAL");
+      const code = (e as { code?: string }).code;
+      if (code !== "CANCELLED") setExportError(code ?? "INTERNAL");
     }
   };
   const reanalyse = () => {
     for (const p of pairs) if (p) setPair({ ...p, status: "pending" });
-    void runtime.analyseStitch();
+    void runtime.analyseStitch({ force: true });
   };
   const onSeamChange = (j: number, c: SeamChange) => {
     const p = pairs[j];
@@ -209,7 +216,7 @@ function StitchWorkspace() {
         </div>
 
         {failed && (
-          <Notice tone="warning" icon={<AlertTriangle />} title="These screenshots can’t be stitched as they are" className="mb-3">
+          <Notice tone="warning" icon={<AlertTriangle />} title={failed.error === "CANCELLED" ? "Alignment stopped" : "These screenshots can’t be stitched as they are"} className="mb-3" actions={<Button variant="secondary" onClick={reanalyse}>Try alignment again</Button>}>
             {messageFor(failed.error ?? "INTERNAL")}
           </Notice>
         )}
@@ -223,6 +230,9 @@ function StitchWorkspace() {
             {messageFor(exportError)}
           </Notice>
         )}
+        {exportBlocked && <Notice tone="warning" className="mb-3" title="This export exceeds the supported limits">{exportDecision?.strategy.kind === "reduce-or-split" ? "A source image exceeds the decoded-memory budget. Use smaller source files; no resolution has been changed." : "The selected format cannot safely encode this output at its original size. Choose PNG, or use Split for separate images. No format or resolution has been changed."}</Notice>}
+        {new Set(originals.map(f => f.width)).size > 1 && <p className="t-body-sm mb-3 text-ink-2">Widths differ. Originals stay left-aligned at their native widths; unused space is transparent, or white in JPEG. No resizing is applied.</p>}
+        {exportDecision?.strategy.kind === "tiled-png" && <p className="t-body-sm mb-3 text-ink-2">This tall PNG will be exported in tiles at its original resolution. Export may take longer.</p>}
 
         <div className="rounded-lg border border-line bg-surface p-2 shadow-xs sm:p-3">
           <div ref={scrollRef} className={cn("relative max-h-[calc(100dvh-15rem)] min-h-[320px] overflow-auto rounded-md bg-surface-2 p-3 sm:p-5 max-md:max-h-[calc(100dvh-13rem)]", (viewport.spaceHeld || viewport.isPanning) && "cursor-grab", viewport.isPanning && "cursor-grabbing")}>
@@ -250,6 +260,7 @@ function StitchWorkspace() {
               <div className="pointer-events-none sticky bottom-3 mx-auto mt-[-4.5rem] w-full max-w-xs rounded-md border border-line bg-surface/95 p-3 shadow-md">
                 <p className="mb-2 text-sm text-ink">{exporting ? "Creating the full-resolution image…" : "Finding where your screenshots overlap…"}</p>
                 <Progress value={exporting ? (exportJob?.progress ?? null) : null} label={exporting ? "Export progress" : "Alignment progress"} />
+                <Button size="sm" variant="secondary" className="pointer-events-auto mt-2" onClick={() => runtime.cancelStitch()}>Cancel {exporting ? "export" : "alignment"}</Button>
               </div>
             )}
           </div>
@@ -282,7 +293,7 @@ function StitchWorkspace() {
     <WorkspaceShell
       tool="stitch"
       status={status}
-      exportAction={originals.length >= 2 ? { label: "Export stitched image", onClick: doExport, disabled: !ready, busy: exporting } : undefined}
+      exportAction={originals.length >= 2 ? { label: "Export stitched image", onClick: doExport, disabled: !ready || exportBlocked, busy: exporting } : undefined}
       fileHint="Drag or use the arrows to change the order. Smart Stitch finds the overlaps automatically."
       inspectorTitle="Alignment"
       canvas={canvas}

@@ -5,8 +5,9 @@
 import { clampQuality, FORMAT_EXT, formatOfMime, withExtension, type OutputFormat } from "./formats";
 import { DEFAULT_BACKGROUND } from "./encode";
 import type { EncodeSettings, EncodeTool } from "./types";
+import { resizePercent } from "./geometry";
 
-/** Screenshots compress well at 80% with little visible change; Convert keeps more detail. */
+/** Starting quality caps. The user inspects the measured result before choosing a trade-off. */
 export const DEFAULT_ENCODE_SETTINGS: Record<EncodeTool, EncodeSettings> = {
   compress: { format: "same", quality: 0.8, background: DEFAULT_BACKGROUND, targetBytes: null },
   convert: { format: "auto", quality: 0.92, background: DEFAULT_BACKGROUND, targetBytes: null },
@@ -43,7 +44,19 @@ export function resolveFormat(tool: EncodeTool, setting: EncodeSettings["format"
 
 export function normaliseSettings(s: EncodeSettings): EncodeSettings {
   const targetBytes = Number.isFinite(s.targetBytes) && (s.targetBytes ?? 0) >= 1024 ? Math.round(s.targetBytes!) : null;
-  return { ...s, quality: clampQuality(s.quality), background: /^#[0-9a-f]{6}$/i.test(s.background) ? s.background.toLowerCase() : DEFAULT_BACKGROUND, targetBytes };
+  return { ...s, ...(s.resizePercent === undefined ? {} : { resizePercent: resizePercent(s.resizePercent) }), quality: clampQuality(s.quality), background: /^#[0-9a-f]{6}$/i.test(s.background) ? s.background.toLowerCase() : DEFAULT_BACKGROUND, targetBytes };
+}
+
+/** Only settings that change encoded pixels/bytes belong in a result key. */
+export function encodeRequestKey(tool: EncodeTool, id: string, source: { width: number; height: number; type: string }, settings: EncodeSettings): string {
+  const format = resolveFormat(tool, settings.format, source.type);
+  return JSON.stringify([tool, id, source.width, source.height, format, format === "png" ? null : settings.quality,
+    format === "jpeg" ? settings.background : null, tool === "compress" && format !== "png" ? settings.targetBytes : null,
+    tool === "compress" ? resizePercent(settings.resizePercent) : 100]);
+}
+
+export function formatComparisonKey(tool: EncodeTool, id: string, source: { width: number; height: number }, settings: EncodeSettings): string {
+  return JSON.stringify(["formats", tool, id, source.width, source.height, settings.quality, settings.background, tool === "compress" ? resizePercent(settings.resizePercent) : 100]);
 }
 
 /** `compressed-shot.jpg` for Compress; `shot.webp` for Convert. */

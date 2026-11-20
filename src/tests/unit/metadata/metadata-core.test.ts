@@ -346,6 +346,30 @@ describe("hostile metadata inside a valid container (reported, removed, never fa
 });
 
 describe("verification catches bad outputs", () => {
+  const orientationWithPrivateBytes = cat(minimalOrientationTiff(6), utf8("SHOTEXA-FAKE private EXIF data"));
+  const orientedInputs = {
+    jpeg: () => jpegWith(load("jpeg/clean"), [exifApp1(orientationWithPrivateBytes)]),
+    png: () => pngWith(load("png/clean"), [pngChunk("eXIf", orientationWithPrivateBytes)]),
+    webp: () => {
+      const original = cleanBytes(load("webp/exif-orientation-6")).output;
+      return riff(...walkWebp(original).chunks.map((chunk) =>
+        chunk.id === "EXIF" ? riffChunk("EXIF", orientationWithPrivateBytes) : original.subarray(chunk.start, chunk.end),
+      ));
+    },
+  };
+
+  it.each(Object.entries(orientedInputs))("%s removes private bytes outside the orientation tag", (format, input) => {
+    const original = input();
+    expect(inspectBytes(original).hasPrivacyMetadata).toBe(true);
+    expect(verifyBytes(original).passed).toBe(false);
+    const cleaned = cleanBytes(original);
+    expect(cleaned.changed).toBe(true);
+    expect(leaks(cleaned.output)).toEqual([]);
+    expect(inspectBytes(cleaned.output)).toMatchObject({ format, orientation: 6, hasPrivacyMetadata: false });
+    expect(verifyBytes(cleaned.output, { original })).toMatchObject({ passed: true, dimensionsMatch: true, payloadIdentical: true });
+    expect(cleanBytes(cleaned.output).changed).toBe(false);
+  });
+
   it("fails when privacy metadata remains, payload changes, dimensions change or output is corrupt", () => {
     const orig = load("jpeg/exif-gps");
     expect(verifyBytes(orig, { original: orig }).unexpectedRemainingPrivacyMetadata.length).toBeGreaterThan(0);

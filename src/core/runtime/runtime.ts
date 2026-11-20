@@ -7,20 +7,29 @@
 import { toast } from "@/components/ui/use-toast";
 import { encodeCanvas } from "@/core/image-encode/encode";
 import { readImageSize } from "@/core/image/image-size";
+import { createBoundedPreview, PreviewError } from "@/core/image/preview";
+import { PREVIEW_LIMITS, previewSize, validImageSize } from "@/core/image/preview-size";
+import { softBudgetFor } from "@/config/limits";
 import { validateImageHeader } from "@/core/image/validate";
 import type { MetadataCleanRun, MetadataInspectRun } from "@/core/metadata/run";
 import { DEFAULT_OCR_CONFIG } from "@/config/ocr";
 import type { OcrService } from "@/core/ocr/ocr-service";
 import type { OcrResult } from "@/core/ocr/types";
+import { hasOcrText } from "@/core/ocr/normalize";
 import type { AnalysedSet, ShotexaPdfEngine } from "@/core/pdf/pdf-engine";
 import type { PageSetup, PaginationPlan } from "@/core/pdf/types";
 import { searchableSourceFromResult } from "@/core/pdf/searchable-text";
 import type { CombinePlan } from "@/core/combine/types";
 import type { CompareAlignEstimate, CompareTextDiff, CompareVisualAnalysis } from "@/core/compare/types";
-import type { EncodeTool } from "@/core/image-encode/types";
+import { EncodeError, type EncodeTool, type FormatCandidate } from "@/core/image-encode/types";
+import { EncodeSession } from "@/core/image-encode/session";
+import { encodeRequestKey, encodedName, formatComparisonKey, resolveFormat } from "@/core/image-encode/settings";
+import { encodeSize, resizePercent } from "@/core/image-encode/geometry";
+import { FORMAT_MIME, OUTPUT_FORMATS } from "@/core/image-encode/formats";
 import type { OutputFormat } from "@/core/image-encode/formats";
 import { IDENTITY_TRANSFORM, isIdentity } from "@/core/image-transform/transform";
-import type { SafeShareExportResult } from "@/core/redaction/types";
+import { RedactionError, type SafeShareExportResult, type SafeShareVerification } from "@/core/redaction/types";
+import { isSafeShareVerified } from "@/core/redaction/verification";
 import { PrivacyScanRegistry } from "@/core/privacy/registry";
 import type { PrivacyScanConfig, PrivacyScanResult } from "@/core/privacy/types";
 import { StructuredResultRegistry } from "@/core/structured-data/registry";
@@ -48,7 +57,13 @@ import { createWorkspaceStore, pairKey, selectJoinKeys, selectOriginals, type Wo
 import { ocrLanguages, type FileId, type FileSource, type ImageMime, type Job, type OcrLanguageChoice, type PdfBreakEdit, type StitchPair, type WorkspaceDocument, type WorkspaceFile } from "./types";
 import { browserWorkerFactories, WorkerBroker } from "./worker-broker";
 
-export const PREVIEW = { maxWidth: 1024, maxPixels: 4_000_000 };
+export const PREVIEW = PREVIEW_LIMITS;
+
+export interface IngestOptions {
+  /** Default waits for previews for existing workflows/API callers; shared picker acknowledges early. */
+  waitForPreviews?: boolean;
+  signal?: AbortSignal;
+}
 
 export interface IngestResult {
   added: FileId[];
@@ -118,6 +133,8 @@ export interface EncodeRunResult {
   format: OutputFormat;
   quality: number;
   background: string;
+  requestedQuality?: number;
+  resizePercent?: number;
   ms: number;
   target?: { bytes: number; metTarget: boolean; attempts: number };
   probe?: { format: OutputFormat; quality: number; bytes: number };
@@ -140,7 +157,7 @@ export interface WorkspacePdfResult {
 
 const EXT: Record<ImageMime, string> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp" };
 /** Worker preview failures the page must not retry itself (see `makePreview`). */
-const NO_PAGE_FALLBACK = new Set(["WORKER_CRASHED", "CANCELLED", "DECODE_FAILED"]);
+const NO_PAGE_FALLBACK = new Set(["WORKER_CRASHED", "CANCELLED", "DECODE_FAILED", "PREVIEW_TOO_LARGE", "PREVIEW_MEMORY_PRESSURE"]);
 const codeOf = (e: unknown) => (e instanceof WorkerJobError ? e.code : ((e as { code?: string })?.code ?? "INTERNAL"));
 const newId = () => (typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `f${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`);
 
@@ -156,12 +173,15 @@ export interface WorkspaceRuntime {
   compareAnalyses: CompareAnalysisRegistry;
   broker: WorkerBroker;
   caps: Capabilities;
-  ingest(files: File[], source: FileSource): Promise<IngestResult>;
+  ingest(files: File[], source: FileSource, options?: IngestOptions): Promise<IngestResult>;
+  cancelPreviews(): void;
+  retryPreviews(): Promise<void>;
   /** Validated local image for branding; it does not become a screenshot. */
   ingestResource(file: File): Promise<IngestResult>;
   removeFile(id: FileId): void;
   clear(): void;
-  analyseStitch(): Promise<void>;
+  analyseStitch(options?: { force?: boolean }): Promise<void>;
+  cancelStitch(): void;
   stitchPlan(): ChainPlan | null;
   exportStitch(): Promise<StitchExportResult>;
   exportCombine(inputIds: FileId[], plan: CombinePlan): Promise<CombineExportResult>;
@@ -181,6 +201,7 @@ export interface WorkspaceRuntime {
    * artifact that records BOTH parents.
    */
   exportCompare(): Promise<EditorExportResult>;
+  cancelCompareExport(): void;
   /**
    * Measure how to put "after" on top of "before" for the current comparison, from small
    * greyscale proxies of the preview bitmaps. Cached until the chosen screenshots or the
@@ -208,18 +229,20 @@ export interface WorkspaceRuntime {
   /** Compose the asset with its Beautifier settings at full resolution into a new artifact. */
   exportBeautified(assetId?: FileId): Promise<EditorExportResult>;
   /**
-   * Compress / Convert: re-encode the asset (same pixel size) with the tool's settings. The
+   * Compress / Convert: re-encode with the tool's settings (original size unless resized). The
    * result is returned for comparison, not added — `saveEncoded` makes it an artifact.
    */
-  encodeAsset(tool: EncodeTool, assetId?: FileId): Promise<EncodeRunResult>;
+  encodeAsset(tool: EncodeTool, assetId?: FileId, options?: { signal?: AbortSignal; measureAlternative?: boolean }): Promise<EncodeRunResult>;
   /** Measure PNG/JPEG/WebP from one bounded decode. Results are unsaved until selected. */
-  compareEncodeFormats(assetId?: FileId): Promise<FormatComparisonRun>;
+  compareEncodeFormats(assetId?: FileId, tool?: EncodeTool, options?: { signal?: AbortSignal }): Promise<FormatComparisonRun>;
+  cancelEncode(): void;
   /** Add an encoded result to the workspace as a new, selected artifact. */
   saveEncoded(result: EncodeRunResult): FileId;
   /** Whether the asset has transparent pixels (checked on its preview); null until known. */
   hasTransparency(assetId: FileId): Promise<boolean | null>;
   exportSafeShare(assetId?: FileId): Promise<WorkspaceSafeShareResult>;
   prepareSafeShare(assetId?: FileId): Promise<WorkspaceSafeShareResult>;
+  extractPreparedSafeShareText(id: FileId): Promise<OcrResult>;
   publishPreparedSafeShare(id: FileId): FileId;
   discardPreparedSafeShare(id: FileId): void;
   inspectMetadata(assetId?: FileId): Promise<MetadataInspectRun>;
@@ -257,7 +280,9 @@ export function createWorkspaceRuntime(opts: {
   pageEvents?: EventTarget | null;
 } = {}): WorkspaceRuntime {
   const registry = new AssetRegistry();
-  const pendingSafeShares = new Map<FileId, { sourceId: FileId; blob: Blob; width: number; height: number; mime: ImageMime; producedBy: "safe-share" | "blur" }>();
+  const encodeSession = new EncodeSession();
+  let encodeJobSequence = 0;
+  const pendingSafeShares = new Map<FileId, { sourceId: FileId; blob: Blob; width: number; height: number; mime: ImageMime; producedBy: "safe-share" | "blur"; verification: Readonly<SafeShareVerification> }>();
   const ocrResults = new OcrResultRegistry();
   const structuredResults = new StructuredResultRegistry();
   const privacyScans = new PrivacyScanRegistry();
@@ -266,6 +291,8 @@ export function createWorkspaceRuntime(opts: {
   const backgroundMasks = new BackgroundMaskRegistry();
   const compareAnalyses = new CompareAnalysisRegistry();
   const store = createWorkspaceStore((id) => {
+    previewRequests.get(id)?.abort.abort();
+    encodeSession.forget(registry.blob(id));
     registry.remove(id);
     for (const [pendingId, pending] of pendingSafeShares) if (pending.sourceId === id) {
       registry.remove(pendingId);
@@ -282,6 +309,8 @@ export function createWorkspaceRuntime(opts: {
   });
   const broker = opts.broker ?? new WorkerBroker(browserWorkerFactories());
   const caps = opts.caps ?? detectCapabilities();
+  const nav = typeof navigator === "undefined" ? undefined : navigator;
+  const previewBudget = softBudgetFor({ deviceMemoryGiB: (nav as (Navigator & { deviceMemory?: number }) | undefined)?.deviceMemory, isIOS: /iPad|iPhone|iPod/.test(nav?.userAgent ?? "") || (nav?.platform === "MacIntel" && (nav?.maxTouchPoints ?? 0) > 1) });
   const proxies = new Map<FileId, GrayImage>();
   /** Transparency found on each asset's preview (Compress/Convert); dropped with the asset. */
   const alphaCache = new Map<FileId, boolean>();
@@ -289,6 +318,9 @@ export function createWorkspaceRuntime(opts: {
   let activeBatchAbort: AbortController | null = null;
   let activePrivacyAbort: AbortController | null = null;
   let previewChain: Promise<void> = Promise.resolve();
+  const previewRequests = new Map<FileId, { blob: Blob; abort: AbortController; promise: Promise<void> }>();
+  let ingestTail: Promise<void> = Promise.resolve();
+  let inputGeneration = 0;
   let disposed = false;
   /**
    * The page is being left — a navigation, a closed tab, or a move into the back/forward
@@ -301,21 +333,35 @@ export function createWorkspaceRuntime(opts: {
   let leaving = false;
   let pageAbort = new AbortController();
   let ocrService: OcrService | null = null;
+  let ocrServiceLoading: Promise<OcrService> | null = null;
   let activeOcrAsset: FileId | null = null;
   let activeOcrAbort: AbortController | null = null;
+  let ocrRequestRevision = 0;
   let activeStructuredAbort: AbortController | null = null;
   let activeBackgroundAbort: AbortController | null = null;
   let activeCompareTextAbort: AbortController | null = null;
   let activeCompareReportAbort: AbortController | null = null;
+  let activeCompareExportAbort: AbortController | null = null;
+  let activeStitchAnalysisAbort: AbortController | null = null;
+  let activeStitchExportAbort: AbortController | null = null;
+  let stitchAnalysisRun: Promise<void> | null = null;
+  let stitchAnalysisSignature = "";
   let pdfEngine: ShotexaPdfEngine | null = null;
   let activePdfAbort: AbortController | null = null;
 
   const getOcrService = async () => {
     if (ocrService) return ocrService;
-    ocrService = opts.createOcrService
-      ? await opts.createOcrService()
-      : (await import("@/core/ocr/ocr-service")).createOcrService();
-    return ocrService;
+    if (!ocrServiceLoading) {
+      ocrServiceLoading = (opts.createOcrService
+        ? opts.createOcrService()
+        : import("@/core/ocr/ocr-service").then((module) => module.createOcrService()))
+        .then(async (service) => {
+          if (disposed) { await service.dispose(); throw Object.assign(new Error("OCR_CANCELLED"), { code: "OCR_CANCELLED" }); }
+          ocrService = service;
+          return service;
+        }).finally(() => { ocrServiceLoading = null; });
+    }
+    return ocrServiceLoading;
   };
 
   const getPdfEngine = async () => {
@@ -329,18 +375,57 @@ export function createWorkspaceRuntime(opts: {
   const job = (id: string, kind: Job["kind"], status: Job["status"], progress: number | null = null, error?: string) =>
     store.getState().upsertJob({ id, kind, status, progress, error });
 
-  /** Downscaled preview via the Image Worker (full decode off the main thread); page fallback. */
+  /** One serial preview queue. Reuse queued/cached work; every request owns its Blob and signal. */
   function makePreview(id: FileId): Promise<void> {
-    return track(() => makePreviewNow(id));
+    const blob = registry.blob(id);
+    if (!blob || disposed || leaving || registry.preview(id)) return Promise.resolve();
+    const existing = previewRequests.get(id);
+    if (existing?.blob === blob && !existing.abort.signal.aborted) return existing.promise;
+    existing?.abort.abort();
+    const abort = new AbortController();
+    const request = { blob, abort, promise: Promise.resolve() };
+    previewRequests.set(id, request);
+    job(`preview:${id}`, "preview", "running", 0);
+    const current = () => !disposed && previewRequests.get(id) === request && registry.blob(id) === blob && !!store.getState().files[id];
+    request.promise = track(() => previewChain.then(async () => {
+      if (!current() || abort.signal.aborted || leaving) return;
+      // Header validation/store updates get a paint/input opportunity before native decoding.
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (!current() || abort.signal.aborted || leaving) return;
+      await makePreviewNow(id, blob, abort.signal);
+    })).then(() => {
+      if (current()) job(`preview:${id}`, "preview", abort.signal.aborted || !registry.preview(id) ? "cancelled" : "done", registry.preview(id) ? 1 : null);
+    }).catch((error) => {
+      const cancelled = abort.signal.aborted || codeOf(error) === "CANCELLED";
+      const code = codeOf(error);
+      if (current()) job(`preview:${id}`, "preview", cancelled ? "cancelled" : "failed", null, cancelled ? "CANCELLED" : code === "PREVIEW_TOO_LARGE" || code === "PREVIEW_MEMORY_PRESSURE" ? code : "DECODE_FAILED");
+    }).finally(() => { if (previewRequests.get(id) === request) previewRequests.delete(id); });
+    previewChain = request.promise;
+    return request.promise;
   }
 
-  async function makePreviewNow(id: FileId) {
-    const blob = registry.blob(id);
-    if (!blob || disposed || leaving) return;
+  function cancelPreviews() {
+    for (const [id, request] of previewRequests) {
+      request.abort.abort();
+      if (store.getState().files[id]) job(`preview:${id}`, "preview", "cancelled");
+    }
+  }
+
+  async function makePreviewNow(id: FileId, blob: Blob, signal: AbortSignal) {
+    if (disposed || leaving || signal.aborted) return;
+    const file = store.getState().files[id];
+    if (!file) return;
+    const target = previewSize(file);
+    const estimated = (file.width * file.height + target.width * target.height) * 4;
+    if (estimated > previewBudget) throw new PreviewError("PREVIEW_TOO_LARGE");
+    const remainingBudget = previewBudget - registry.previewMemory().bytes;
+    // Resident previews count too. Stop background decoding before another source exceeds the
+    // existing device-aware soft budget; keep every original for removal, retry or explicit tools.
+    if (estimated > remainingBudget) throw new PreviewError("PREVIEW_MEMORY_PRESSURE");
     let bitmap: ImageBitmap;
     let displaySize: { width: number; height: number } | undefined;
     try {
-      const preview = await broker.run("image", "image.preview", { image: blob, ...PREVIEW });
+      const preview = await broker.run("image", "image.preview", { image: blob, ...PREVIEW, budgetBytes: remainingBudget }, { signal });
       bitmap = preview.bitmap;
       displaySize = { width: preview.width, height: preview.height };
     } catch (error) {
@@ -351,17 +436,14 @@ export function createWorkspaceRuntime(opts: {
       // decode started then is refused ("Cannot load blob … due to access control checks").
       // A crashed worker (or one out of memory) is no better served by the same decode on the
       // main thread, and a failed decode would fail identically there.
-      if (disposed || leaving) return;
+      if (disposed || leaving || signal.aborted || registry.blob(id) !== blob) return;
       if (NO_PAGE_FALLBACK.has(codeOf(error))) throw error;
       if (!store.getState().files[id]) return;
-      const full = await createImageBitmap(blob);
-      displaySize = { width: full.width, height: full.height };
-      const s = Math.min(1, PREVIEW.maxWidth / full.width, Math.sqrt(PREVIEW.maxPixels / (full.width * full.height)));
-      try {
-        bitmap = await createImageBitmap(full, { resizeWidth: Math.max(1, Math.round(full.width * s)), resizeHeight: Math.max(1, Math.round(full.height * s)), resizeQuality: "high" });
-      } finally { full.close(); }
+      const preview = await createBoundedPreview(blob, { ...PREVIEW, budgetBytes: remainingBudget, signal });
+      bitmap = preview.bitmap;
+      displaySize = { width: preview.width, height: preview.height };
     }
-    if (disposed || !store.getState().files[id]) {
+    if (disposed || signal.aborted || registry.blob(id) !== blob || !store.getState().files[id]) {
       bitmap.close();
       return;
     }
@@ -374,7 +456,7 @@ export function createWorkspaceRuntime(opts: {
   function resumePreviews() {
     for (const id of Object.keys(store.getState().files)) {
       if (registry.preview(id)) continue;
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
     }
   }
 
@@ -382,6 +464,11 @@ export function createWorkspaceRuntime(opts: {
   function markLeaving() {
     if (leaving) return;
     leaving = true;
+    cancelPreviews();
+    encodeSession.cancel();
+    cancelStitch();
+    cancelCompareExport();
+    activeCompareReportAbort?.abort();
     broker.suspend?.();
     pageAbort.abort();
   }
@@ -407,7 +494,7 @@ export function createWorkspaceRuntime(opts: {
   pageEvents?.addEventListener("pagehide", onPageHide);
   pageEvents?.addEventListener("pageshow", onPageShow);
   /**
-   * Image work in progress. A `beforeunload` listener can keep a page out of Firefox's
+   * Queued or running image work. A `beforeunload` listener can keep a page out of Firefox's
    * back/forward cache, so it is attached only while such work runs (web.dev guidance).
    */
   let busy = 0;
@@ -426,8 +513,7 @@ export function createWorkspaceRuntime(opts: {
     if (cached) return cached;
     const bm = registry.preview(id);
     if (!bm) return null;
-    const w = HINT.width;
-    const h = Math.max(1, Math.round((bm.height * w) / bm.width));
+    const { width: w, height: h } = previewSize(bm, { maxWidth: Math.min(HINT.width, bm.width), maxPixels: 65536, maxHeight: 2048 });
     const canvas: OffscreenCanvas | HTMLCanvasElement = caps.offscreenCanvas ? new OffscreenCanvas(w, h) : Object.assign(document.createElement("canvas"), { width: w, height: h });
     const ctx = canvas.getContext("2d", { willReadFrequently: true }) as OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null;
     if (!ctx) return null;
@@ -468,27 +554,50 @@ export function createWorkspaceRuntime(opts: {
 
   async function checkOverlap() {
     const s = store.getState();
+    const current = () => !disposed && store.getState().order === s.order;
     const originals = selectOriginals(s);
     if (originals.length < 2 || s.overlapHint.dismissed || s.overlapHint.status !== "idle") return;
     if (originals.some((f) => !registry.preview(f.id))) return; // wait for previews
     store.getState().setOverlapHint({ status: "checking" });
+    if (!current()) return;
     job("overlap", "overlap-check", "running");
     const likely: string[] = [];
+    try {
     for (let i = 0; i + 1 < originals.length; i++) {
+      if (!current()) return;
       const a = proxyOf(originals[i].id);
       const b = proxyOf(originals[i + 1].id);
       if (a && b && likelyOverlap(a, b).likely) likely.push(pairKey(originals[i].id, originals[i + 1].id));
       await new Promise((r) => setTimeout(r, 0));
     }
+    if (!current()) return;
     store.getState().setOverlapHint({ status: likely.length ? "likely" : "unlikely", pairs: likely });
     job("overlap", "overlap-check", "done");
+    } catch {
+      // This optional suggestion must never turn a successful file load/retry into a rejection.
+      if (current()) {
+        store.getState().setOverlapHint({ status: "idle", pairs: [] });
+        job("overlap", "overlap-check", "failed", null, "MEMORY_PRESSURE");
+      }
+    }
   }
 
-  async function ingest(files: File[], source: FileSource, asResource = false): Promise<IngestResult> {
+  async function ingest(files: File[], source: FileSource, options: IngestOptions = {}, asResource = false): Promise<IngestResult> {
+    const generation = inputGeneration;
+    const accepted = track(() => ingestTail.then(() => acceptFiles(files, source, asResource, options.signal, generation)));
+    ingestTail = accepted.then(() => undefined, () => undefined);
+    const { result, ready } = await accepted;
+    if (options.waitForPreviews !== false) await ready;
+    return result;
+  }
+
+  async function acceptFiles(files: File[], source: FileSource, asResource: boolean, signal: AbortSignal | undefined, generation: number) {
     const rejected: IngestResult["rejected"] = [];
     const metas: WorkspaceFile[] = [];
+    const blobs: Blob[] = [];
+    const stopped = () => disposed || leaving || signal?.aborted || generation !== inputGeneration;
     for (const file of files) {
-      if (disposed || leaving) break; // no new file reads once the page is being left
+      if (stopped()) break;
       // Reading a file can fail: it was moved or deleted, or the page is being left and WebKit
       // has already stopped file reads (NotReadableError). Neither may escape as an error.
       let head: Uint8Array;
@@ -496,7 +605,7 @@ export function createWorkspaceRuntime(opts: {
       try {
         head = new Uint8Array(await file.slice(0, 16).arrayBuffer());
       } catch {
-        if (disposed || leaving) break;
+        if (stopped()) break;
         rejected.push({ name: file.name || "Pasted image", code: "UNREADABLE" });
         continue;
       }
@@ -506,60 +615,82 @@ export function createWorkspaceRuntime(opts: {
         continue;
       }
       try {
-        size = await readImageSize(file); // header only — no decode
+        size = await readImageSize(file, signal); // bounded headers only — no decode
       } catch {
-        if (disposed || leaving) break;
+        if (stopped()) break;
         size = null;
       }
-      if (!size) {
+      if (stopped()) break;
+      if (!size || !validImageSize(size)) {
         rejected.push({ name: file.name || "Pasted image", code: "UNREADABLE" });
         continue;
       }
       const id = newId();
       // Sanitised once, here: the name reaches download attributes and ZIP entries later.
       const name = source === "paste" || !file.name ? `Pasted screenshot ${++pasteCount}.${EXT[v.type]}` : safeFileName(file.name, `screenshot.${EXT[v.type]}`);
-      registry.put(id, file);
+      blobs.push(file);
       metas.push({ id, name, type: v.type, bytes: file.size, width: size.width, height: size.height, source, kind: asResource ? "resource" : "original", addedAt: Date.now(), previewVersion: 0 });
+      if (metas.length % 8 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
+    if (stopped()) return { result: { added: [], rejected }, ready: Promise.resolve() };
     // WorkspaceProvider already presents one concise, aria-live ingestion summary. Keep
     // that established notice as the sole file-add/rejection announcement rather than
     // showing a second toast for the same action.
     if (metas.length) {
+      metas.forEach((meta, index) => registry.put(meta.id, blobs[index]));
       if (asResource) store.getState().addResources(metas);
       else store.getState().addFiles(metas);
     }
-    // Previews one at a time (each is a full decode transiently — Spike B), then the hint.
-    for (const m of metas) {
-      previewChain = previewChain.then(async () => {
-        job(`preview:${m.id}`, "preview", "running");
-        try {
-          await makePreview(m.id);
-          job(`preview:${m.id}`, "preview", "done");
-        } catch {
-          job(`preview:${m.id}`, "preview", "failed", null, "DECODE_FAILED");
-        }
-      });
-    }
-    if (!asResource) previewChain = previewChain.then(() => checkOverlap());
-    await previewChain;
-    return { added: metas.map((m) => m.id), rejected };
+    const previews = metas.map((m) => makePreview(m.id));
+    const onAbort = () => { for (const meta of metas) previewRequests.get(meta.id)?.abort.abort(); };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    const ready = Promise.all(previews).then(async () => {
+      if (!asResource && !stopped()) await checkOverlap();
+    }).catch(() => undefined).finally(() => signal?.removeEventListener("abort", onAbort));
+    return { result: { added: metas.map((m) => m.id), rejected }, ready };
   }
 
-  async function analyseStitch() {
+  function cancelStitch() {
+    if (activeStitchAnalysisAbort) {
+      activeStitchAnalysisAbort.abort();
+      // Native matching and script/WASM loading cannot receive CANCEL until they
+      // yield. Vision is the dedicated stitching family, so release it promptly.
+      broker.release("vision");
+    }
+    activeStitchExportAbort?.abort();
+  }
+
+  async function analyseStitch(options: { force?: boolean } = {}) {
     const keys = selectJoinKeys(store.getState());
+    const signature = keys.join(",");
+    if (stitchAnalysisRun && !options.force && !activeStitchAnalysisAbort?.signal.aborted && stitchAnalysisSignature === signature) return stitchAnalysisRun;
+    if (activeStitchAnalysisAbort) { activeStitchAnalysisAbort.abort(); broker.release("vision"); }
+    const abort = new AbortController();
+    activeStitchAnalysisAbort = abort;
+    stitchAnalysisSignature = signature;
+    stitchAnalysisRun = (async () => { await Promise.resolve(); try {
     for (const [i, key] of keys.entries()) {
+      if (abort.signal.aborted || disposed || activeStitchAnalysisAbort !== abort) break;
       const s = store.getState();
       const existing = s.stitch.pairs[key];
-      if (existing && (existing.status === "ready" || existing.status === "analysing")) continue;
+      if (!options.force && existing?.status === "ready") continue;
       const [a, b] = key.split("|");
+      const blobA = registry.blob(a), blobB = registry.blob(b);
+      if (!s.files[a] || !s.files[b] || !blobA || !blobB) break;
+      const owns = () => activeStitchAnalysisAbort === abort && !disposed;
+      const inputsPresent = () => registry.blob(a) === blobA && registry.blob(b) === blobB && selectJoinKeys(store.getState()).includes(key);
       const base: StitchPair = { key, a, b, status: "analysing", autoOffset: s.files[a].height, offset: s.files[a].height, confidence: "low", matched: false, bands: { top: 0, bottom: 0 } };
       s.setPair(base);
       job(`analyse:${key}`, "stitch-analyse", "running", i / keys.length);
       try {
+        const { stitchAnalysisIssue } = await import("@/core/stitch/limits");
+        if (stitchAnalysisIssue(s.files[a], s.files[b], caps.offscreenCanvas)) throw Object.assign(new Error("Stitch analysis exceeds supported memory/canvas limits"), { code: "MEMORY_PRESSURE" });
+        if (abort.signal.aborted) throw Object.assign(new Error("CANCELLED"), { code: "CANCELLED" });
         const r = caps.offscreenCanvas
-          ? await broker.run("vision", "stitch.analyse", { a: registry.blob(a)!, b: registry.blob(b)! })
-          : await broker.run("vision", "stitch.analyseGray", { a: await pageGray(registry.blob(a)!), b: await pageGray(registry.blob(b)!) });
-        if (!store.getState().files[a] || !store.getState().files[b]) continue; // removed meanwhile
+          ? await broker.run("vision", "stitch.analyse", { a: blobA, b: blobB }, { signal: abort.signal })
+          : await broker.run("vision", "stitch.analyseGray", { a: await pageGray(blobA), b: await pageGray(blobB) }, { signal: abort.signal });
+        if (abort.signal.aborted || !owns() || !inputsPresent()) throw Object.assign(new Error("CANCELLED"), { code: "CANCELLED" });
         store.getState().setPair({
           ...base,
           status: "ready",
@@ -568,13 +699,22 @@ export function createWorkspaceRuntime(opts: {
           confidence: r.status === "matched" ? r.confidenceClass : "low",
           matched: r.status === "matched",
           bands: r.bands,
+          matchScore: r.confidence,
+          matchNotes: r.breakdown?.caps ?? [],
+          matchReason: r.reason,
         });
         job(`analyse:${key}`, "stitch-analyse", "done", 1);
       } catch (e) {
-        store.getState().setPair({ ...base, status: "failed", error: codeOf(e) });
-        job(`analyse:${key}`, "stitch-analyse", "failed", null, codeOf(e));
+        if (!owns()) continue;
+        const code = abort.signal.aborted ? "CANCELLED" : codeOf(e);
+        if (inputsPresent()) store.getState().setPair({ ...base, status: "failed", error: code });
+        job(`analyse:${key}`, "stitch-analyse", code === "CANCELLED" ? "cancelled" : "failed", null, code);
       }
     }
+    } finally {
+      if (activeStitchAnalysisAbort === abort) { activeStitchAnalysisAbort = null; stitchAnalysisRun = null; }
+    } })();
+    return stitchAnalysisRun;
   }
 
   function stitchPlan(): ChainPlan | null {
@@ -598,6 +738,13 @@ export function createWorkspaceRuntime(opts: {
     const images = originals.map((f) => registry.blob(f.id)!);
     const sources = originals.map((f) => ({ width: f.width, height: f.height }));
     const { format, quality } = s.exportSettings;
+    activeStitchExportAbort?.abort();
+    const abort = new AbortController();
+    activeStitchExportAbort = abort;
+    const signature = JSON.stringify({ plan, ids: originals.map(f => f.id), format, quality });
+    const current = () => !disposed && !abort.signal.aborted && activeStitchExportAbort === abort &&
+      images.every((blob, i) => registry.blob(originals[i].id) === blob) &&
+      JSON.stringify({ plan: stitchPlan(), ids: selectOriginals(store.getState()).map(f => f.id), format: store.getState().exportSettings.format, quality: store.getState().exportSettings.quality }) === signature;
     const jobId = `export:${Date.now()}`;
     job(jobId, "stitch-export", "running", 0);
     // Never keep the OpenCV runtime alive during composition (Spike B).
@@ -606,15 +753,17 @@ export function createWorkspaceRuntime(opts: {
       // The main-thread fallback is imported on demand so page bundles never ship the encoder.
       const composePlan = { width: plan.width, height: plan.height, segments: plan.segments };
       const result = caps.offscreenCanvas
-        ? await broker.run("image", "stitch.composeChain", { images, plan: composePlan, sources, format, quality }, { onProgress: (p) => job(jobId, "stitch-export", "running", p) })
+        ? await broker.run("image", "stitch.composeChain", { images, plan: composePlan, sources, format, quality }, { signal: abort.signal, onProgress: (p) => { if (current()) job(jobId, "stitch-export", "running", p); } })
         : await (await import("@/core/stitch/compose-chain")).composeChain(images, composePlan, {
             format,
             quality,
             sources,
+            signal: abort.signal,
             createCanvas: (w, h) => Object.assign(document.createElement("canvas"), { width: w, height: h }),
             yieldBetweenTiles: timeSlicer(),
-            onProgress: (p) => job(jobId, "stitch-export", "running", p),
+            onProgress: (p) => { if (current()) job(jobId, "stitch-export", "running", p); },
           });
+      if (!current()) throw Object.assign(new Error("CANCELLED"), { code: "CANCELLED" });
       // Large outputs: recycle the worker so decoded memory is returned (Spike B/D).
       if (plan.width * plan.height > 16_000_000) broker.release("image");
       const id = newId();
@@ -635,11 +784,14 @@ export function createWorkspaceRuntime(opts: {
         previewVersion: 0,
       });
       job(jobId, "stitch-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       return { id, width: result.width, height: result.height, bytes: result.blob.size };
     } catch (e) {
-      job(jobId, "stitch-export", "failed", null, codeOf(e));
-      throw Object.assign(new Error(codeOf(e)), { code: codeOf(e) });
+      const code = abort.signal.aborted ? "CANCELLED" : codeOf(e);
+      job(jobId, "stitch-export", code === "CANCELLED" ? "cancelled" : "failed", null, code);
+      throw Object.assign(new Error(code), { code });
+    } finally {
+      if (activeStitchExportAbort === abort) activeStitchExportAbort = null;
     }
   }
 
@@ -681,7 +833,7 @@ export function createWorkspaceRuntime(opts: {
         previewVersion: 0,
       });
       job(jobId, "combine-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       return { id, width: result.width, height: result.height, bytes: result.blob.size };
     } catch (error) {
       const code = codeOf(error);
@@ -735,7 +887,7 @@ export function createWorkspaceRuntime(opts: {
         previewVersion: 0,
       });
       job(jobId, "editor-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       return { id, width: result.width, height: result.height, bytes: result.blob.size, sourceId };
     } catch (error) {
       const code = codeOf(error);
@@ -789,7 +941,7 @@ export function createWorkspaceRuntime(opts: {
         previewVersion: 0,
       });
       job(jobId, "annotate-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       return { id, width: result.width, height: result.height, bytes: result.blob.size, sourceId };
     } catch (error) {
       const code = codeOf(error);
@@ -837,6 +989,8 @@ export function createWorkspaceRuntime(opts: {
     }
   }
 
+  function cancelCompareExport() { activeCompareExportAbort?.abort(); }
+
   async function exportCompare(): Promise<EditorExportResult> {
     const s = store.getState();
     const settings = s.compare;
@@ -848,20 +1002,28 @@ export function createWorkspaceRuntime(opts: {
     const a = { width: fileA.width, height: fileA.height };
     const b = { width: fileB.width, height: fileB.height };
     const { format, quality } = s.exportSettings;
+    activeCompareExportAbort?.abort();
+    const abort = new AbortController();
+    activeCompareExportAbort = abort;
+    const signature = JSON.stringify({settings,format,quality});
+    const current = () => !disposed && !abort.signal.aborted && activeCompareExportAbort === abort && registry.blob(settings.a!) === blobA && registry.blob(settings.b!) === blobB && JSON.stringify({settings:store.getState().compare,format:store.getState().exportSettings.format,quality:store.getState().exportSettings.quality}) === signature;
+    const check = () => { if (!current()) throw Object.assign(new Error("COMPARE_CANCELLED"), { code:"COMPARE_CANCELLED" }); };
     const jobId = `compare:${Date.now()}`;
     job(jobId, "compare-export", "running", 0);
     try {
-      const onProgress = (progress: number) => job(jobId, "compare-export", "running", progress);
+      const onProgress = (progress: number) => { if (current()) job(jobId, "compare-export", "running", progress); };
       // The export applies the SAME measured alignment the preview showed, not a new one.
       const alignment = settings.alignment.mode === "off" ? null : await alignCompare();
+      check();
       const result = caps.offscreenCanvas
-        ? await broker.run("image", "compare.export", { imageA: blobA, imageB: blobB, settings, a, b, alignment, format, quality }, { onProgress })
+        ? await broker.run("image", "compare.export", { imageA: blobA, imageB: blobB, settings, a, b, alignment, format, quality }, { signal:abort.signal, onProgress })
         : await (await import("@/core/compare/render")).renderCompare(blobA, blobB, settings, {
             a,
             b,
             alignment,
             format,
             quality,
+            signal: abort.signal,
             createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
             onProgress,
           });
@@ -869,6 +1031,7 @@ export function createWorkspaceRuntime(opts: {
       if (Math.max(result.width * result.height, a.width * a.height, b.width * b.height) > 16_000_000) broker.release("image");
       const mime: ImageMime = format === "png" ? "image/png" : format === "jpeg" ? "image/jpeg" : "image/webp";
       const { COMPARE_NAMES } = await import("@/core/compare/presets");
+      check();
       const id = newId();
       registry.put(id, result.blob);
       // Two parents: the comparison is derived from both screenshots, and neither is changed.
@@ -887,12 +1050,14 @@ export function createWorkspaceRuntime(opts: {
         previewVersion: 0,
       });
       job(jobId, "compare-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       return { id, width: result.width, height: result.height, bytes: result.blob.size, sourceId: settings.a };
     } catch (error) {
-      const code = codeOf(error);
-      job(jobId, "compare-export", "failed", null, code);
+      const code = !current() ? "COMPARE_CANCELLED" : codeOf(error);
+      job(jobId, "compare-export", code === "COMPARE_CANCELLED" ? "cancelled" : "failed", null, code);
       throw Object.assign(new Error(code), { code });
+    } finally {
+      if (activeCompareExportAbort === abort) activeCompareExportAbort = null;
     }
   }
 
@@ -1088,6 +1253,7 @@ export function createWorkspaceRuntime(opts: {
    */
   async function measureCompare(maxWidth = 1200): Promise<CompareVisualAnalysis | null> {
     const { settings, idA, idB, fileA, fileB, sizeA, sizeB, pair } = compareContext();
+    const signature = JSON.stringify(settings);
     const bitmapA = registry.preview(idA);
     const bitmapB = registry.preview(idB);
     if (!bitmapA || !bitmapB) return null;
@@ -1121,6 +1287,7 @@ export function createWorkspaceRuntime(opts: {
         const { applyTextChanges } = await import("@/core/compare/analysis");
         enriched = applyTextChanges(analysis, textDiff, { a: layout.a, b: layout.b });
       }
+      if (disposed || JSON.stringify(store.getState().compare) !== signature || registry.preview(idA) !== bitmapA || registry.preview(idB) !== bitmapB) return null;
       compareAnalyses.setVisual(pair, enriched);
       bumpCompare();
       return enriched;
@@ -1195,28 +1362,32 @@ export function createWorkspaceRuntime(opts: {
     activeCompareReportAbort?.abort();
     const abort = new AbortController();
     activeCompareReportAbort = abort;
+    const settingsSignature = JSON.stringify(settings);
+    const reportCurrent = () => !disposed && !abort.signal.aborted && activeCompareReportAbort === abort && JSON.stringify(store.getState().compare) === settingsSignature && !!registry.blob(idA) && !!registry.blob(idB);
+    const checkReport = () => { if (!reportCurrent()) throw Object.assign(new Error("COMPARE_CANCELLED"), { code: "COMPARE_CANCELLED" }); };
     const jobId = `compare-report:${pair}`;
     job(jobId, "compare-report", "running", null);
-    const setStage = (text: string) => store.getState().setCompareRun({ pair, report: { status: "running", kind, stage: text, error: undefined } });
+    const setStage = (text: string) => { checkReport(); store.getState().setCompareRun({ pair, report: { status: "running", kind, stage: text, error: undefined } }); };
     setStage("Collecting measurements…");
     try {
       const [{ buildCompareSummary, summaryToJson }, { COMPARE_REPORT_NAMES }] = await Promise.all([import("@/core/compare/summary"), import("@/core/compare/presets")]);
       const estimate = settings.alignment.mode === "off" ? null : await alignCompare();
       // A report always carries a measurement, even if the user never opened Difference.
-      if (!compareAnalyses.visual(pair)) {
-        setStage("Measuring the difference…");
-        await measureCompare();
-      }
+      checkReport();
+      setStage("Measuring the difference…");
+      const reportAnalysis = await measureCompare();
+      checkReport();
+      if (!reportAnalysis) throw Object.assign(new Error("COMPARE_REPORT_FAILED"), { code: "COMPARE_REPORT_FAILED" });
       const [alphaA, alphaB] = await Promise.all([hasTransparency(idA), hasTransparency(idB)]);
       const summary = buildCompareSummary({
         a: { name: fileA.name, width: fileA.width, height: fileA.height, bytes: fileA.bytes, type: fileA.type, transparent: alphaA },
         b: { name: fileB.name, width: fileB.width, height: fileB.height, bytes: fileB.bytes, type: fileB.type, transparent: alphaB },
         settings,
         alignment: estimate,
-        analysis: compareAnalyses.visual(pair),
+        analysis: reportAnalysis,
         textDiff: compareAnalyses.textDiff(pair),
       });
-      if (abort.signal.aborted) throw Object.assign(new Error("COMPARE_CANCELLED"), { code: "COMPARE_CANCELLED" });
+      checkReport();
       let blob: Blob;
       let name: string;
       if (kind === "json") {
@@ -1238,6 +1409,7 @@ export function createWorkspaceRuntime(opts: {
           name = COMPARE_REPORT_NAMES.zip;
         }
       }
+      checkReport();
       compareAnalyses.setReport(pair, { kind, name, blob, createdAt: Date.now() });
       store.getState().setCompareRun({ pair, report: { status: "done", kind, stage: undefined, error: undefined } });
       bumpCompare();
@@ -1246,12 +1418,14 @@ export function createWorkspaceRuntime(opts: {
       return { blob, name };
     } catch (error) {
       const raw = codeOf(error);
-      const cancelled = raw === "COMPARE_CANCELLED" || abort.signal.aborted;
+      const cancelled = raw === "COMPARE_CANCELLED" || !reportCurrent();
       const code = cancelled ? "COMPARE_CANCELLED" : raw === "ZIP_TOO_LARGE" || raw === "ZIP_EMPTY" || raw === "ZIP_CREATE_FAILED" ? raw : "COMPARE_REPORT_FAILED";
-      job(jobId, "compare-report", cancelled ? "cancelled" : "failed", null, code);
-      store.getState().setCompareRun({ pair, report: { status: cancelled ? "idle" : "failed", kind, stage: undefined, error: code } });
+      if (activeCompareReportAbort === abort) {
+        job(jobId, "compare-report", cancelled ? "cancelled" : "failed", null, code);
+        store.getState().setCompareRun({ pair, report: { status: cancelled ? "idle" : "failed", kind, stage: undefined, error: code } });
+      }
       if (!cancelled) toast({ type: "error", message: "Report not created", description: "The comparison itself is unaffected. Try the JSON summary, or a smaller comparison." });
-      throw Object.assign(new Error(code), { code });
+      throw Object.assign(new Error(code, { cause: error }), { code });
     } finally {
       if (activeCompareReportAbort === abort) activeCompareReportAbort = null;
     }
@@ -1307,7 +1481,7 @@ export function createWorkspaceRuntime(opts: {
         previewVersion: 0,
       });
       job(jobId, "beautify-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       return { id, width: result.width, height: result.height, bytes: result.blob.size, sourceId };
     } catch (error) {
       const code = codeOf(error);
@@ -1316,96 +1490,101 @@ export function createWorkspaceRuntime(opts: {
     }
   }
 
-  async function encodeAsset(tool: EncodeTool, assetId?: FileId): Promise<EncodeRunResult> {
+  async function encodeAsset(tool: EncodeTool, assetId?: FileId, options: { signal?: AbortSignal; measureAlternative?: boolean } = {}): Promise<EncodeRunResult> {
     const { id: sourceId, file, blob } = selected(assetId);
-    const { resolveFormat, encodedName } = await import("@/core/image-encode/settings");
-    const settings = store.getState().encode[tool];
+    const settings = { ...store.getState().encode[tool] };
     const format = resolveFormat(tool, settings.format, file.type);
     const source = { width: file.width, height: file.height };
-    // PNG has no quality setting; measure WebP too so any hint quotes a real size.
-    const probe = format === "png" ? { format: "webp" as const, quality: 0.8 } : undefined;
+    const percent = tool === "compress" ? resizePercent(settings.resizePercent) : 100;
+    const expected = encodeSize(source, percent);
+    const requestKey = encodeRequestKey(tool, sourceId, file, settings);
+    const measureAlternative = options.measureAlternative !== false;
+    const cacheKey = `encode:${requestKey}:${measureAlternative}`;
+    // Existing API callers retain their measured PNG hint; Compressor UI measures alternatives on intent.
+    const probe = measureAlternative && format === "png" ? { format: "webp" as const, quality: 0.8 } : undefined;
     const targetBytes = tool === "compress" && format !== "png" ? settings.targetBytes : null;
-    const input = { source, format, quality: settings.quality, background: settings.background, probe, targetBytes };
-    const jobId = `encode:${Date.now()}`;
-    job(jobId, "encode", "running", 0);
-    try {
-      const onProgress = (progress: number) => job(jobId, "encode", "running", progress);
-      const result = caps.offscreenCanvas
-        ? await broker.run("image", "image.encode", { image: blob, ...input }, { onProgress })
-        : await track(async () => (await import("@/core/image-encode/reencode")).encodeImage(blob, {
-            ...input,
-            signal: pageAbort.signal,
-            createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
-            yieldBetweenTiles: timeSlicer(),
-            onProgress,
-          }));
-      if (source.width * source.height > 16_000_000) broker.release("image");
-      job(jobId, "encode", "done", 1);
-      const mime: ImageMime = format === "png" ? "image/png" : format === "jpeg" ? "image/jpeg" : "image/webp";
-      return {
-        tool,
-        sourceId,
-        name: encodedName(tool, file.name, format),
-        type: mime,
-        blob: result.blob,
-        width: result.width,
-        height: result.height,
-        bytes: result.blob.size,
-        originalBytes: file.bytes,
-        format,
-        quality: result.quality,
-        background: settings.background,
-        ms: result.ms,
-        target: result.target,
-        probe: result.probe,
-      };
-    } catch (error) {
-      const code = codeOf(error);
-      job(jobId, "encode", "failed", null, code);
-      throw Object.assign(new Error(code), { code });
-    }
+    const input = { source, format, quality: settings.quality, background: settings.background, probe, targetBytes, resizePercent: percent };
+    return encodeSession.run(cacheKey, blob, async (signal) => {
+      const jobId = `encode:${++encodeJobSequence}`;
+      job(jobId, "encode", "running", 0);
+      try {
+        const onProgress = (progress: number) => { if (!signal.aborted) job(jobId, "encode", "running", progress); };
+        const result = caps.offscreenCanvas
+          ? await broker.run("image", "image.encode", { image: blob, ...input }, { signal, onProgress })
+          : await track(async () => (await import("@/core/image-encode/reencode")).encodeImage(blob, {
+              ...input, signal,
+              createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
+              yieldBetweenTiles: timeSlicer(), onProgress,
+            }));
+        if (signal.aborted || disposed || registry.blob(sourceId) !== blob || encodeRequestKey(tool, sourceId, file, store.getState().encode[tool]) !== requestKey) throw new EncodeError("ENCODE_CANCELLED");
+        if (result.blob.type !== FORMAT_MIME[format] || result.width !== expected.width || result.height !== expected.height) throw new EncodeError("ENCODE_VERIFY_FAILED");
+        if (source.width * source.height > 16_000_000) broker.release("image");
+        job(jobId, "encode", "done", 1);
+        return {
+          tool, sourceId, name: encodedName(tool, file.name, format), type: FORMAT_MIME[format], blob: result.blob,
+          width: result.width, height: result.height, bytes: result.blob.size, originalBytes: file.bytes, format,
+          quality: result.quality ?? settings.quality, requestedQuality: settings.quality, resizePercent: percent,
+          background: settings.background, ms: result.ms, target: result.target, probe: result.probe,
+        };
+      } catch (error) {
+        const code = signal.aborted || codeOf(error) === "CANCELLED" ? "ENCODE_CANCELLED" : codeOf(error);
+        job(jobId, "encode", code === "ENCODE_CANCELLED" ? "cancelled" : "failed", null, code);
+        throw Object.assign(new Error(code), { code });
+      }
+    }, (value) => value.bytes, options.signal);
   }
 
-  async function compareEncodeFormats(assetId?: FileId): Promise<FormatComparisonRun> {
+  async function compareEncodeFormats(assetId?: FileId, tool: EncodeTool = "convert", options: { signal?: AbortSignal } = {}): Promise<FormatComparisonRun> {
     const { id: sourceId, file, blob } = selected(assetId);
-    const { encodedName } = await import("@/core/image-encode/settings");
-    const settings = store.getState().encode.convert;
+    const settings = { ...store.getState().encode[tool] };
     const source = { width: file.width, height: file.height };
-    const input = { source, quality: settings.quality, background: settings.background };
-    const jobId = `encode:${Date.now()}`;
-    job(jobId, "encode", "running", 0);
-    try {
-      const onProgress = (progress: number) => job(jobId, "encode", "running", progress);
-      const comparison = caps.offscreenCanvas
-        ? await broker.run("image", "image.compareFormats", { image: blob, ...input }, { onProgress })
-        : await (await import("@/core/image-encode/reencode")).compareFormats(blob, {
-            ...input,
-            createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
-            yieldBetweenTiles: timeSlicer(),
-            onProgress,
-          });
-      job(jobId, "encode", "done", 1);
-      const candidates = comparison.candidates.map((candidate) => ({
-        tool: "convert" as const,
-        sourceId,
-        name: encodedName("convert", file.name, candidate.format),
-        type: (candidate.format === "png" ? "image/png" : candidate.format === "jpeg" ? "image/jpeg" : "image/webp") as ImageMime,
-        blob: candidate.blob,
-        width: candidate.width,
-        height: candidate.height,
-        bytes: candidate.bytes,
-        originalBytes: file.bytes,
-        format: candidate.format,
-        quality: candidate.quality,
-        background: settings.background,
-        ms: comparison.ms,
-      }));
-      return { sourceId, candidates, ms: comparison.ms };
-    } catch (error) {
-      const code = codeOf(error);
-      job(jobId, "encode", "failed", null, code);
-      throw Object.assign(new Error(code), { code });
-    }
+    const percent = tool === "compress" ? resizePercent(settings.resizePercent) : 100;
+    const expected = encodeSize(source, percent);
+    const key = formatComparisonKey(tool, sourceId, file, settings);
+    return encodeSession.run(key, blob, async (signal) => {
+      const jobId = `encode:${++encodeJobSequence}`;
+      job(jobId, "encode", "running", 0);
+      try {
+        const existing = OUTPUT_FORMATS.flatMap((format) => {
+          const entry = encodeSession.peek<EncodeRunResult>(`encode:${encodeRequestKey(tool, sourceId, file, { ...settings, format, targetBytes: null })}:${tool !== "compress"}`, blob);
+          return entry ? [{ ...entry, strategy: "single-canvas" as const } satisfies FormatCandidate] : [];
+        });
+        const input = { source, quality: settings.quality, background: settings.background, resizePercent: percent, existing };
+        const onProgress = (progress: number) => { if (!signal.aborted) job(jobId, "encode", "running", progress); };
+        const comparison = caps.offscreenCanvas
+          ? await broker.run("image", "image.compareFormats", { image: blob, ...input }, { signal, onProgress })
+          : await (await import("@/core/image-encode/reencode")).compareFormats(blob, {
+              ...input, signal,
+              createCanvas: (width, height) => Object.assign(document.createElement("canvas"), { width, height }),
+              yieldBetweenTiles: timeSlicer(), onProgress,
+            });
+        if (signal.aborted || disposed || registry.blob(sourceId) !== blob || formatComparisonKey(tool, sourceId, file, store.getState().encode[tool]) !== key) throw new EncodeError("ENCODE_CANCELLED");
+        if (comparison.candidates.length !== 3 || new Set(comparison.candidates.map((candidate) => candidate.format)).size !== 3) throw new EncodeError("ENCODE_VERIFY_FAILED");
+        const candidates = comparison.candidates.map((candidate) => {
+          if (candidate.blob.type !== FORMAT_MIME[candidate.format] || candidate.width !== expected.width || candidate.height !== expected.height) throw new EncodeError("ENCODE_VERIFY_FAILED");
+          return {
+            tool, sourceId, name: encodedName(tool, file.name, candidate.format), type: FORMAT_MIME[candidate.format],
+            blob: candidate.blob, width: candidate.width, height: candidate.height, bytes: candidate.blob.size,
+            originalBytes: file.bytes, format: candidate.format, quality: candidate.quality, requestedQuality: settings.quality,
+            resizePercent: percent, background: settings.background, ms: comparison.ms,
+          };
+        });
+        for (const candidate of candidates) {
+          const manual = { ...settings, format: candidate.format, targetBytes: null };
+          encodeSession.remember(`encode:${encodeRequestKey(tool, sourceId, file, manual)}:${tool !== "compress"}`, blob, candidate, candidate.bytes);
+          if (tool === "compress" && settings.targetBytes && candidate.format !== "png" && candidate.bytes <= settings.targetBytes) {
+            const targeted = { ...candidate, target: { bytes: settings.targetBytes, metTarget: true, attempts: 1 } };
+            encodeSession.remember(`encode:${encodeRequestKey(tool, sourceId, file, { ...manual, targetBytes: settings.targetBytes })}:false`, blob, targeted, candidate.bytes);
+          }
+        }
+        job(jobId, "encode", "done", 1);
+        return { sourceId, candidates, ms: comparison.ms };
+      } catch (error) {
+        const code = signal.aborted || codeOf(error) === "CANCELLED" ? "ENCODE_CANCELLED" : codeOf(error);
+        job(jobId, "encode", code === "ENCODE_CANCELLED" ? "cancelled" : "failed", null, code);
+        throw Object.assign(new Error(code), { code });
+      }
+    }, (value) => value.candidates.reduce((sum, candidate) => sum + candidate.bytes, 0), options.signal);
   }
 
   function saveEncoded(result: EncodeRunResult): FileId {
@@ -1426,7 +1605,7 @@ export function createWorkspaceRuntime(opts: {
       addedAt: Date.now(),
       previewVersion: 0,
     });
-    previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+    void makePreview(id);
     return id;
   }
 
@@ -1457,7 +1636,7 @@ export function createWorkspaceRuntime(opts: {
     const settings = structuredClone(store.getState().batch.settings);
     const operation = store.getState().batch.operation;
     const { filenamePrefix, filenameSuffix } = store.getState().batch;
-    const allIds = store.getState().batch.selectedIds;
+    const allIds = [...new Set([...store.getState().batch.selectedIds, ...ids])].filter((id) => !!state.files[id]);
     const plannedNames = uniqueOutputNames(allIds.map((id) => {
       const file = store.getState().files[id] as BatchSource;
       return withAffixes(batchOutputName(operation, file.name, batchFormat(operation, file, settings)), filenamePrefix, filenameSuffix);
@@ -1478,7 +1657,7 @@ export function createWorkspaceRuntime(opts: {
           if (!current || !blob) throw Object.assign(new Error("Source removed"), { code: "BATCH_SOURCE_MISSING" });
           const source: BatchSource = current;
           const format = batchFormat(operation, source, settings);
-          const onProgress = (p: number) => job(jobId, "batch", "running", (index + p) / ids.length);
+          const onProgress = (p: number) => job(jobId, "batch", "running", (allIds.length - ids.length + index + p) / allIds.length);
           let output: Blob;
           let width = source.width;
           let height = source.height;
@@ -1567,9 +1746,9 @@ export function createWorkspaceRuntime(opts: {
         },
         abort.signal,
         {
-          before: (id, index) => { store.getState().setBatchRun("running", index); store.getState().setBatchItem(id, { status: "processing" }); },
-          success: (id, result, index) => { batchResults.put(result); store.getState().setBatchItem(id, { status: "completed", resultId: result.id }); job(jobId, "batch", "running", (index + 1) / ids.length); },
-          failure: (id, error) => store.getState().setBatchItem(id, { status: "failed", error: codeOf(error), resultId: undefined }),
+          before: (id) => { store.getState().setBatchRun("running", allIds.indexOf(id)); store.getState().setBatchItem(id, { status: "processing" }); },
+          success: (id, result, index) => { batchResults.put(result); store.getState().setBatchItem(id, { status: "completed", resultId: result.id }); job(jobId, "batch", "running", (allIds.length - ids.length + index + 1) / allIds.length); },
+          failure: (id, error, index) => { store.getState().setBatchItem(id, { status: "failed", error: codeOf(error), resultId: undefined }); job(jobId, "batch", "running", (allIds.length - ids.length + index + 1) / allIds.length); },
           cancelled: (id) => store.getState().setBatchItem(id, { status: "cancelled", error: undefined, resultId: undefined }),
           // Especially important on WebKit's main-thread fallback: browser input gets a real
           // task between files, so Cancel can stop before the next full decode begins.
@@ -1619,7 +1798,7 @@ export function createWorkspaceRuntime(opts: {
     });
     store.getState().addArtifacts(added);
     store.getState().markBatchAdded();
-    for (const file of added) previewChain = previewChain.then(() => makePreview(file.id)).catch(() => undefined);
+    for (const file of added) void makePreview(file.id);
     return added.map((f) => f.id);
   }
 
@@ -1645,7 +1824,7 @@ export function createWorkspaceRuntime(opts: {
     });
     // New artifacts only: the source keeps its blob and its split settings.
     store.getState().addArtifacts(added);
-    for (const f of added) previewChain = previewChain.then(() => makePreview(f.id)).catch(() => undefined);
+    for (const f of added) void makePreview(f.id);
     return added.map((f) => f.id);
   }
 
@@ -1659,7 +1838,7 @@ export function createWorkspaceRuntime(opts: {
       type: blob.type, bytes: blob.size, width, height,
       source: "artifact", kind: "artifact", producedBy, addedAt: Date.now(), previewVersion: 0,
     });
-    previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+    void makePreview(id);
     return id;
   }
 
@@ -1689,7 +1868,7 @@ export function createWorkspaceRuntime(opts: {
       addedAt: Date.now(),
       previewVersion: 0,
     });
-    previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+    void makePreview(id);
     return id;
   }
 
@@ -1712,12 +1891,14 @@ export function createWorkspaceRuntime(opts: {
           });
       if (result.width * result.height > 16_000_000) broker.release("image");
       const mime: ImageMime = format === "png" ? "image/png" : format === "jpeg" ? "image/jpeg" : "image/webp";
+      if (!isSafeShareVerified(result.verification) || result.blob.type !== mime) throw new RedactionError("REDACTION_VERIFY_FAILED");
+      if (!store.getState().files[sourceId] || registry.blob(sourceId) !== blob) throw new RedactionError("REDACTION_VERIFY_FAILED", "Source is no longer available");
       const producedBy = s.activeTool === "blur" ? "blur" : "safe-share";
       const { blob: outputBlob, ...rest } = result;
       const artifactId = pendingReview ? newId() : registerArtifact(outputBlob, `safe-copy.${EXT[mime]}`, sourceId, producedBy, result.width, result.height);
       if (pendingReview) {
         registry.put(artifactId, outputBlob);
-        pendingSafeShares.set(artifactId, { sourceId, blob: outputBlob, width: result.width, height: result.height, mime, producedBy });
+        pendingSafeShares.set(artifactId, { sourceId, blob: outputBlob, width: result.width, height: result.height, mime, producedBy, verification: Object.freeze({ ...result.verification }) });
       }
       job(jobId, "redaction-export", "done", 1);
       return { ...rest, id: artifactId, bytes: outputBlob.size };
@@ -1730,21 +1911,39 @@ export function createWorkspaceRuntime(opts: {
 
   const exportSafeShare = (assetId?: FileId) => renderSafeShareArtifact(assetId);
   const prepareSafeShare = (assetId?: FileId) => renderSafeShareArtifact(assetId, true);
-  function publishPreparedSafeShare(id: FileId): FileId {
+  function verifiedPreparedSafeShare(id: FileId) {
     const pending = pendingSafeShares.get(id);
-    if (!pending || !store.getState().files[pending.sourceId] || !registry.blob(id)) throw new Error("Reviewed image is no longer available");
+    if (!pending || !store.getState().files[pending.sourceId] || registry.blob(id) !== pending.blob ||
+      pending.blob.type !== pending.mime || !isSafeShareVerified(pending.verification)) throw new RedactionError("REDACTION_VERIFY_FAILED");
+    return pending;
+  }
+  async function extractPreparedSafeShareText(id: FileId): Promise<OcrResult> {
+    const pending = verifiedPreparedSafeShare(id);
+    try {
+      const { result } = await extractTextFromBlob(id, pending.blob, store.getState().ocr.language, true, false);
+      verifiedPreparedSafeShare(id); // The copy may have been discarded while OCR was running.
+      return result;
+    } finally {
+      ocrResults.removeAsset(id);
+    }
+  }
+  function publishPreparedSafeShare(id: FileId): FileId {
+    const pending = verifiedPreparedSafeShare(id);
+    if (activeOcrAsset === id) throw new RedactionError("REDACTION_VERIFY_FAILED", "The optional text check is still running");
     store.getState().addArtifact({
       id, name: `safe-copy.${EXT[pending.mime]}`, type: pending.mime, bytes: pending.blob.size,
       width: pending.width, height: pending.height, source: "artifact", kind: "artifact",
       derivedFrom: [pending.sourceId], producedBy: pending.producedBy, addedAt: Date.now(), previewVersion: 0,
     });
     pendingSafeShares.delete(id);
-    previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+    void makePreview(id);
     return id;
   }
   function discardPreparedSafeShare(id: FileId): void {
     if (!pendingSafeShares.has(id)) return;
+    if (activeOcrAsset === id) void cancelOcr(id, true).catch(() => undefined);
     pendingSafeShares.delete(id);
+    ocrResults.removeAsset(id);
     registry.remove(id);
   }
 
@@ -1782,27 +1981,44 @@ export function createWorkspaceRuntime(opts: {
 
   async function extractText(assetId?: FileId, language?: OcrLanguageChoice, silent = false): Promise<WorkspaceOcrResult> {
     const { id, blob } = selected(assetId);
-    const choice = language ?? store.getState().ocr.language;
-    if (activeOcrAsset) await cancelOcr(activeOcrAsset);
+    return extractTextFromBlob(id, blob, language ?? store.getState().ocr.language, silent);
+  }
+
+  function extractTextFromBlob(id: FileId, blob: Blob, choice: OcrLanguageChoice, silent: boolean, recordState = true): Promise<WorkspaceOcrResult> {
+    return track(() => extractTextFromBlobNow(id, blob, choice, silent, recordState));
+  }
+
+  async function extractTextFromBlobNow(id: FileId, blob: Blob, choice: OcrLanguageChoice, silent: boolean, recordState: boolean): Promise<WorkspaceOcrResult> {
+    const requestRevision = ++ocrRequestRevision;
+    if (activeOcrAsset) await cancelOcr(activeOcrAsset, true, false);
+    if (requestRevision !== ocrRequestRevision || disposed) throw Object.assign(new Error("OCR_CANCELLED"), { code: "OCR_CANCELLED" });
     activeOcrAsset = id;
     const abort = new AbortController();
     activeOcrAbort = abort;
-    store.getState().beginOcr(id, choice);
+    if (recordState) store.getState().beginOcr(id, choice);
     const jobId = `ocr:${id}`;
     job(jobId, "ocr", "running", 0);
     // Avoid retaining another large WASM heap while Tesseract is active.
     broker.release("vision");
     broker.release("document");
     let service: OcrService | null = null;
+    const ownsRequest = () => activeOcrAbort === abort;
+    const ownsSource = () => !recordState || registry.blob(id) === blob;
+    const pageSignal = pageAbort.signal;
+    const onPageAbort = () => { abort.abort(); if (ownsRequest()) void service?.cancel(); };
+    if (disposed || leaving || pageSignal.aborted) abort.abort();
+    else pageSignal.addEventListener("abort", onPageAbort, { once: true });
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
     try {
       service = await getOcrService();
+      if (abort.signal.aborted || !ownsRequest() || !ownsSource()) throw Object.assign(new Error("OCR_CANCELLED"), { code: "OCR_CANCELLED" });
       timer = setTimeout(() => {
+        if (!ownsRequest() || abort.signal.aborted) return;
         timedOut = true;
         abort.abort();
         void service?.cancel();
-    }, opts.ocrTimeoutMs ?? DEFAULT_OCR_CONFIG.recognitionTimeoutMs);
+      }, opts.ocrTimeoutMs ?? DEFAULT_OCR_CONFIG.recognitionTimeoutMs);
       const result = await service.extract(blob, {
         languages: ocrLanguages(choice),
         preprocessing: "auto",
@@ -1810,43 +2026,48 @@ export function createWorkspaceRuntime(opts: {
         strips: "auto",
         signal: abort.signal,
         onProgress: (progress, stage) => {
-          if (activeOcrAsset !== id) return;
-          store.getState().setOcrProgress(id, progress, stage);
+          if (!ownsRequest() || abort.signal.aborted || !ownsSource()) return;
+          if (recordState) store.getState().setOcrProgress(id, progress, stage);
           job(jobId, "ocr", "running", progress);
         },
       });
       if (timedOut) throw Object.assign(new Error("OCR_TIMEOUT"), { code: "OCR_TIMEOUT" });
+      if (abort.signal.aborted || !ownsRequest() || !ownsSource()) throw Object.assign(new Error("OCR_CANCELLED"), { code: "OCR_CANCELLED" });
       const resultId = ocrResults.put(id, result);
-      store.getState().completeOcr(id, {
+      if (recordState) store.getState().completeOcr(id, {
         resultId,
         editedText: result.editedText,
         confidence: result.confidence,
         durationMs: result.timings.totalMs,
       });
       job(jobId, "ocr", "done", 1);
-      if (!silent) toast({ type: "success", message: "Text extracted", description: "Text is ready to copy or download." });
+      if (!silent) toast(hasOcrText(result) ? { type: "success", message: "Text extracted", description: "Review the text before copying or downloading it." } : { type: "info", message: "No text found", description: "Try another language or a clearer copy. Your screenshot is unchanged." });
       return { resultId, result };
     } catch (error) {
+      // A retired request must not mutate a retry's state or retain results for removed inputs.
+      if (!ownsRequest() || !ownsSource()) throw Object.assign(new Error("OCR_CANCELLED"), { code: "OCR_CANCELLED" });
       const code = timedOut ? "OCR_TIMEOUT" : codeOf(error);
       if (code === "OCR_CANCELLED") {
-        store.getState().cancelOcr(id);
+        if (recordState) store.getState().cancelOcr(id);
         job(jobId, "ocr", "cancelled", null, code);
       } else {
-        store.getState().failOcr(id, code);
+        if (recordState) store.getState().failOcr(id, code);
         job(jobId, "ocr", "failed", null, code);
         if (!silent) toast({ type: "error", message: "Extraction failed", description: "Could not extract text from this image." });
       }
       throw Object.assign(new Error(code), { code });
     } finally {
       if (timer) clearTimeout(timer);
-      if (activeOcrAsset === id) {
+      pageSignal.removeEventListener("abort", onPageAbort);
+      if (ownsRequest()) {
         activeOcrAsset = null;
         activeOcrAbort = null;
       }
     }
   }
 
-  async function cancelOcr(assetId?: FileId, silent = false): Promise<void> {
+  async function cancelOcr(assetId?: FileId, silent = false, invalidatePending = true): Promise<void> {
+    if (invalidatePending) ocrRequestRevision++;
     const id = assetId ?? activeOcrAsset;
     if (!id) return;
     store.getState().cancelOcr(id);
@@ -1855,8 +2076,8 @@ export function createWorkspaceRuntime(opts: {
       activeOcrAbort?.abort();
       activeOcrAbort = null;
       activeOcrAsset = null;
+      await ocrService?.cancel();
     }
-    await ocrService?.cancel();
     if (!silent) toast({ type: "info", message: "Text extraction cancelled" });
   }
 
@@ -2025,7 +2246,7 @@ export function createWorkspaceRuntime(opts: {
       // history remain visible. Continue With explicitly selects the derived artifact.
       store.getState().select(assetId);
       job(jobId, "background-export", "done", 1);
-      previewChain = previewChain.then(() => makePreview(id)).catch(() => undefined);
+      void makePreview(id);
       if (result.width * result.height > 16_000_000) broker.release("background");
       toast({ type: "success", message: "Export ready", description: `${result.width} × ${result.height} ${format.toUpperCase()} created locally.` });
       return { id, width: result.width, height: result.height, bytes: result.blob.size, sourceId: assetId };
@@ -2116,10 +2337,12 @@ export function createWorkspaceRuntime(opts: {
       const searchableText = searchable
         ? inputIds.map((id, imageIndex) => {
             const result = ocrResults.forAsset(id);
-            if (!result) throw Object.assign(new Error("OCR required"), { code: "PDF_OCR_REQUIRED" });
+            const state = s.ocr.byAsset[id];
+            if (!result || state?.status !== "done" || state.language !== s.ocr.language || ocrResults.get(state.resultId) !== result) throw Object.assign(new Error("OCR required"), { code: "PDF_OCR_REQUIRED" });
             return searchableSourceFromResult(imageIndex, result, id);
           })
         : undefined;
+      if (searchableText && !searchableText.some((source) => source.lines.length > 0)) throw Object.assign(new Error("No searchable OCR text"), { code: "PDF_OCR_EMPTY" });
       const result = await engine.createPdf(
         {
           images: blobs as Blob[],
@@ -2203,19 +2426,25 @@ export function createWorkspaceRuntime(opts: {
     broker,
     caps,
     ingest,
-    ingestResource: (file) => ingest([file], "picker", true),
+    ingestResource: (file) => ingest([file], "picker", {}, true),
+    cancelPreviews,
+    retryPreviews: async () => { await Promise.all(Object.keys(store.getState().files).map((id) => makePreview(id))); await checkOverlap(); },
     removeFile: (id) => {
       proxies.delete(id);
       store.getState().removeFile(id);
       void checkOverlap();
     },
     clear: () => {
+      inputGeneration++;
+      cancelPreviews();
+      encodeSession.clear();
       proxies.clear();
       store.getState().clear();
       for (const id of pendingSafeShares.keys()) registry.remove(id);
       pendingSafeShares.clear();
     },
     analyseStitch,
+    cancelStitch,
     stitchPlan,
     exportStitch,
     exportCombine,
@@ -2225,6 +2454,7 @@ export function createWorkspaceRuntime(opts: {
     addSplitPieces,
     exportBeautified,
     exportCompare,
+    cancelCompareExport,
     alignCompare,
     resetCompareAlignment,
     analyseCompareText,
@@ -2234,10 +2464,12 @@ export function createWorkspaceRuntime(opts: {
     exportCompareReport,
     encodeAsset,
     compareEncodeFormats,
+    cancelEncode: () => encodeSession.cancel(),
     saveEncoded,
     hasTransparency,
     exportSafeShare,
     prepareSafeShare,
+    extractPreparedSafeShareText,
     publishPreparedSafeShare,
     discardPreparedSafeShare,
     inspectMetadata,
@@ -2265,6 +2497,11 @@ export function createWorkspaceRuntime(opts: {
     addConvertedImage,
     dispose() {
       disposed = true;
+      cancelStitch();
+      cancelCompareExport();
+      activeCompareReportAbort?.abort();
+      inputGeneration++;
+      cancelPreviews();
       pageAbort.abort();
       pageEvents?.removeEventListener("pagehide", onPageHide);
       pageEvents?.removeEventListener("pageshow", onPageShow);
@@ -2272,6 +2509,7 @@ export function createWorkspaceRuntime(opts: {
       pageEvents?.removeEventListener("pointerdown", onStillHere);
       pageEvents?.removeEventListener("keydown", onStillHere);
       unsubscribe();
+      encodeSession.clear();
       store.getState().clear();
       pendingSafeShares.clear();
       registry.clear();

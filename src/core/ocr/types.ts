@@ -95,6 +95,7 @@ export type PageSegmentation = "auto" | "single-column" | "single-block" | "spar
 
 export interface OcrInitOptions {
   languages: OcrLanguage[];
+  onProgress?: (fraction: number, stage: string) => void;
 }
 
 export interface OcrOptions {

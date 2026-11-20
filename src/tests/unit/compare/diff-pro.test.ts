@@ -163,7 +163,7 @@ describe("the perceptual metric", () => {
 });
 
 describe("anti-aliasing and near-identical colour", () => {
-  /** A hard vertical edge, one pixel further right in B — exactly a sub-pixel shift. */
+  /** A hard vertical edge, one whole pixel further right in B. */
   const edge = (at: number) => buffer(12, 6, (x) => (x < at ? [0, 0, 0, 255] : [255, 255, 255, 255]));
 
   it("off by default: a one-pixel edge shift is reported", () => {
@@ -171,9 +171,9 @@ describe("anti-aliasing and near-identical colour", () => {
     expect(result.changed).toBe(6);
   });
 
-  it("drops a changed pixel whose colour simply moved next door", () => {
+  it("keeps a genuine whole-pixel edge shift even with the noise filter on", () => {
     const result = run(edge(5), edge(6), 12, 6, { threshold: 12, diff: diff({ ignoreAntialiasing: true }) });
-    expect(result.changed).toBe(0);
+    expect(result.changed).toBe(6);
   });
 
   it("keeps a real change even with the anti-aliasing guard on", () => {

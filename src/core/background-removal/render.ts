@@ -1,3 +1,5 @@
+import { FORMAT_MIME } from "@/core/image-encode/formats";
+import { readImageSize } from "@/core/image/image-size";
 import { encodeCanvas, prepareBackground } from "@/core/image-encode/encode";
 import { unmatteInk } from "./ink";
 import { maskBounds, refineMask } from "./mask";
@@ -104,6 +106,12 @@ export async function renderRemovedBackground(image: Blob, options: BackgroundRe
     if (options.signal?.aborted) throw new BackgroundRemovalError("BACKGROUND_CANCELLED");
     const blob = await encodeCanvas(output, options.format, options.quality);
     if (!blob) throw new BackgroundRemovalError("BACKGROUND_EXPORT_FAILED");
+    const size = await readImageSize(blob, options.signal);
+    if (options.signal?.aborted) throw new BackgroundRemovalError("BACKGROUND_CANCELLED");
+    if (blob.type !== FORMAT_MIME[options.format] || size?.format !== options.format ||
+        size.width !== outWidth || size.height !== outHeight) {
+      throw new BackgroundRemovalError("BACKGROUND_EXPORT_FAILED");
+    }
     return { blob, width: outWidth, height: outHeight, bytes: blob.size };
   } catch (error) {
     if (error instanceof BackgroundRemovalError) throw error;

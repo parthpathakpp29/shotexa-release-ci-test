@@ -6,6 +6,7 @@
 import { DEFAULT_LIMITS } from "@/config/limits";
 import { createPngStreamEncoder } from "@/core/export/png-stream-encoder";
 import { readImageSize } from "@/core/image/image-size";
+import { FORMAT_MIME } from "@/core/image-encode/formats";
 import { chooseOutputStrategy, type OutputFormat } from "@/core/image/output-strategy";
 import { encodeCanvas } from "@/core/image-encode/encode";
 import { createBlobBitmapProvider } from "@/core/image/tiled-compose";
@@ -135,7 +136,7 @@ export async function composeCombine(images: Blob[], plan: CombinePlan, options:
     throw error;
   }
   const size = await readImageSize(blob);
-  if (!size || size.width !== width || size.height !== plan.height) throw new CombineError("COMBINE_EXPORT_VERIFY_FAILED", `${size?.width}x${size?.height}`);
+  if (!size || size.format !== options.format || blob.type !== FORMAT_MIME[options.format] || size.width !== width || size.height !== plan.height) throw new CombineError("COMBINE_EXPORT_VERIFY_FAILED", `${size?.width}x${size?.height}`);
   options.onProgress?.(1);
   return { blob, width, height: plan.height, strategy: decision.strategy.kind, ms: Math.round(performance.now() - started) };
 }

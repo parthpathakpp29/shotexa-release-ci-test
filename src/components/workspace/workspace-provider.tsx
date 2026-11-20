@@ -19,6 +19,8 @@ import type { WorkspaceActions, WorkspaceState } from "@/core/runtime/store";
 import type { FileId, FileSource } from "@/core/runtime/types";
 import { releaseWorkflowOutputs } from "@/core/workflows/output-registry";
 import { trackAnalyticsEvent } from "@/lib/analytics";
+import { imageMemoryWarning } from "@/core/image/preview-size";
+import { LoadingFeedback } from "./loading-feedback";
 
 interface WorkspaceContextValue {
   runtime: WorkspaceRuntime;
@@ -41,6 +43,8 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const pendingDispose = useRef<ReturnType<typeof setTimeout> | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const inputRequests = useRef(new Set<AbortController>());
+  const [checking, setChecking] = useState(0);
 
   // Dispose when the workspace unmounts (leaving the group); survives StrictMode's double mount.
   useEffect(() => {
@@ -71,16 +75,24 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
     async (files: File[], source: FileSource) => {
       const unique = dedupeDroppedFiles(files);
       if (!unique.length) return [];
+      const abort = new AbortController();
+      inputRequests.current.add(abort);
+      setChecking((count) => count + unique.length);
       // Callers fire and forget (paste, drop, the picker), so nothing may reject from here.
       let r: Awaited<ReturnType<typeof runtime.ingest>>;
       try {
-        r = await runtime.ingest(unique, source);
+        r = await runtime.ingest(unique, source, { waitForPreviews: false, signal: abort.signal });
       } catch {
         if (document.visibilityState === "visible") notify(`${unique.length === 1 ? (unique[0].name || "The image") : "These images"} ${messageFor("UNREADABLE")}`);
         return [];
+      } finally {
+        inputRequests.current.delete(abort);
+        setChecking((count) => Math.max(0, count - unique.length));
       }
+      if (abort.signal.aborted) return r.added;
       const feedback = r.rejected.map((x) => `${x.name} ${messageFor(x.code)}`);
       if (r.added.length) feedback.unshift(`${r.added.length} screenshot${r.added.length === 1 ? "" : "s"} added to workspace`);
+      if (r.added.some((id) => { const file = runtime.store.getState().files[id]; return file && imageMemoryWarning(file); })) feedback.push("Large images may need more memory for processing. Previews are reduced; originals are unchanged.");
       if (r.added.length && source !== "sample" && source !== "artifact") trackAnalyticsEvent("upload_completed");
       if (feedback.length) notify(feedback.join(". "));
       return r.added;
@@ -158,13 +170,11 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
           void addFiles(files, "picker");
         }}
       />
-      <div aria-live="polite" className="pointer-events-none fixed inset-x-0 bottom-4 z-50 flex flex-col items-center gap-2 px-4 max-md:bottom-24">
-        {notices.map((n) => (
-          <p key={n.id} role="status" className="pointer-events-auto max-w-md rounded-md border border-line bg-surface px-4 py-2.5 text-sm text-ink shadow-md">
-            {n.text}
-          </p>
-        ))}
-      </div>
+      <LoadingFeedback runtime={runtime} text={notices[0]?.text} checking={checking} onCancel={() => {
+        inputRequests.current.forEach((request) => request.abort());
+        runtime.cancelPreviews();
+        notify("File processing stopped. Already accepted originals are unchanged.");
+      }} />
     </WorkspaceContext.Provider>
   );
 }

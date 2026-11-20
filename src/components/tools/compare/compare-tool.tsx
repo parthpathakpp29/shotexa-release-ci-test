@@ -76,7 +76,8 @@ function CompareWorkspace() {
       setCompletedId(exported.id);
       downloadAsset(runtime, exported.id);
     } catch (e) {
-      setError((e as { code?: string }).code ?? "COMPARE_INVALID");
+      const code = (e as { code?: string }).code;
+      if (code !== "COMPARE_CANCELLED") setError(code ?? "COMPARE_INVALID");
     }
   }
 
@@ -123,6 +124,7 @@ function CompareWorkspace() {
                 <span className="t-mono text-accent-ink">{job.progress === null ? "" : `${Math.round(job.progress * 100)}%`}</span>
               </div>
               <Progress value={job.progress} label="Export progress" />
+              <Button variant="secondary" size="sm" className="mt-3" onClick={() => runtime.cancelCompareExport()}>Cancel export</Button>
             </div>
           )}
           {order.length < 2 ? (

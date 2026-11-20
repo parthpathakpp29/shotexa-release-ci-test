@@ -1,0 +1,309 @@
+name: Shotexa isolated release verification
+
+on:
+  push:
+    branches:
+      - codex/shotexa-release-ci
+
+permissions:
+  contents: read
+
+jobs:
+  essential-release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CI: 'true'
+      NEXT_TELEMETRY_DISABLED: '1'
+      E2E_BASE_URL: http://localhost:3101
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact candidate before installation
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          from pathlib import Path
+          excluded = {'.github/workflows/shotexa-release-ci.yml'}
+          files = sorted((p for p in Path('.').rglob('*') if p.is_file()
+                          and '.git' not in p.parts and p.as_posix() not in excluded),
+                         key=lambda p: p.as_posix())
+          assert len(files) == 1125, f'Candidate file count: {len(files)}'
+          # Git stores normalized LF for 641 CRLF files and three mixed-ending files.
+          # Rebuild the exact preserved candidate bytes before hashing or testing.
+          crlf_bits = base64.b64decode('fwAAAAAAAAAAAAAAAAD8////////DwAAAAAAAAD//wcCAMAAAADwD+D//////////////wPM////v798ZN33t///5vv/7/1/3++INuF/+f7P/jr/v/zv873//f//386eZ73/WwAAAAQAAAAAtm3btm3bdtu2bbNt27bbNgAIAACsXn8Z8f/hO/E35fsf')
+          mixed = {
+              'src/components/tools/stitch/stitch-tool.tsx': (316, 'f/knuP//////////AAD/////////f7////+b//8fAAD+////////Dw=='),
+              'src/core/ocr/ocr-service.ts': (267, '//////////////////////////g/////////////////Bw=='),
+              'src/core/ocr/tesseract-engine.ts': (247, '////////A///////////////////////////////fw=='),
+          }
+          assert len(crlf_bits) == (len(files) + 7) // 8
+          digest = hashlib.sha256()
+          for index, path in enumerate(files):
+              name = path.as_posix()
+              data = path.read_bytes()
+              if crlf_bits[index // 8] & (1 << (index % 8)):
+                  assert b'\r\n' not in data, f'Unexpected CRLF in Git blob: {name}'
+                  data = data.replace(b'\n', b'\r\n')
+                  path.write_bytes(data)
+              elif name in mixed:
+                  count, encoded = mixed[name]
+                  flags = base64.b64decode(encoded)
+                  lines = data.split(b'\n')
+                  assert len(lines) - 1 == count, f'Unexpected line count: {name}'
+                  rebuilt = bytearray()
+                  for line_index, line in enumerate(lines[:-1]):
+                      rebuilt.extend(line)
+                      rebuilt.extend(b'\r\n' if flags[line_index // 8] & (1 << (line_index % 8)) else b'\n')
+                  rebuilt.extend(lines[-1])
+                  data = bytes(rebuilt)
+                  path.write_bytes(data)
+              content_hash = hashlib.sha256(data).hexdigest()
+              digest.update((name + '\0' + content_hash + '\n').encode())
+          actual = digest.hexdigest()
+          expected = '131cbabd3c91a825fdf420e99ae37a51c1b5bf35100f8b6428421d7b9e87958d'
+          assert actual == expected, f'Candidate manifest digest mismatch: {actual}'
+          print(f'PASS: {len(files)} candidate files; manifest digest {actual}')
+          PY
+          mkdir -p release-evidence
+          git rev-parse HEAD > release-evidence/test-commit.txt
+          printf '1125 files; manifest digest 131cbabd3c91a825fdf420e99ae37a51c1b5bf35100f8b6428421d7b9e87958d\n' > release-evidence/integrity.txt
+
+      - name: Check runner capacity
+        run: |
+          free -h
+          df -h .
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          mem = next(int(line.split()[1]) for line in Path('/proc/meminfo').read_text().splitlines() if line.startswith('MemAvailable:')) * 1024
+          disk = shutil.disk_usage('.').free
+          assert mem >= 10 * 1024**3, f'Available RAM too low: {mem} bytes'
+          assert disk >= 7 * 1024**3, f'Free disk too low: {disk} bytes'
+          print(f'PASS: available RAM {mem} bytes, free disk {disk} bytes')
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install exact lockfile dependencies
+        id: deps
+        run: |
+          set +e
+          npm ci > release-evidence/npm-ci.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/npm-ci.exit
+          cat release-evidence/npm-ci.log
+          exit "$code"
+
+      - name: TypeScript
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        id: typescript
+        run: |
+          set +e
+          npx tsc --noEmit > release-evidence/typescript.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/typescript.exit
+          cat release-evidence/typescript.log
+          exit "$code"
+
+      - name: ESLint
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        id: lint
+        run: |
+          set +e
+          npm run lint > release-evidence/eslint.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/eslint.exit
+          cat release-evidence/eslint.log
+          exit "$code"
+
+      - name: Full unit suite
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        id: unit
+        run: |
+          set +e
+          npm test > release-evidence/unit.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/unit.exit
+          cat release-evidence/unit.log
+          exit "$code"
+
+      - name: Production build and postbuild HEIC guard
+        if: ${{ !cancelled() && steps.typescript.outcome == 'success' && steps.lint.outcome == 'success' && steps.unit.outcome == 'success' }}
+        id: build
+        run: |
+          set +e
+          npm run build > release-evidence/build.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/build.exit
+          cat release-evidence/build.log
+          exit "$code"
+
+      - name: Explicit HEIC and deferred cloud exclusion
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        id: exclusion
+        run: |
+          set +e
+          node scripts/check-v21-no-heic.mjs > release-evidence/heic.log 2>&1
+          code=$?
+          cat release-evidence/heic.log
+          if [ "$code" -eq 0 ]; then
+            python3 - <<'PY' > release-evidence/cloud-exclusion.log 2>&1
+          from pathlib import Path
+          forbidden = [Path('cloudflare'), Path('src/components/share'), Path('src/core/share'),
+                       Path('src/components/tools/redaction/share-link-creator.tsx')]
+          present = [str(p) for p in forbidden if p.exists()]
+          assert not present, f'Deferred cloud source present: {present}'
+          signatures = [b'challenges.cloudflare.com', b'share-link-creator', b'turnstile']
+          hits = []
+          files = 0
+          for path in Path('.next/static').rglob('*'):
+              if path.is_file():
+                  files += 1
+                  data = path.read_bytes().lower()
+                  hits.extend((str(path), s.decode()) for s in signatures if s in data)
+          assert not hits, f'Deferred cloud signature in client assets: {hits}'
+          print(f'PASS: no deferred cloud source or client signatures in {files} static files')
+          PY
+            code=$?
+          fi
+          if [ -f release-evidence/cloud-exclusion.log ]; then cat release-evidence/cloud-exclusion.log; fi
+          printf '%s\n' "$code" > release-evidence/exclusion.exit
+          exit "$code"
+
+      - name: Install Chromium and WebKit with dependencies
+        if: ${{ !cancelled() && steps.exclusion.outcome == 'success' }}
+        id: browsers
+        run: |
+          set +e
+          npx playwright install --with-deps chromium webkit > release-evidence/browser-install.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/browser-install.exit
+          cat release-evidence/browser-install.log
+          exit "$code"
+
+      - name: Start built application
+        if: ${{ !cancelled() && steps.browsers.outcome == 'success' }}
+        id: server
+        run: |
+          setsid npm run start -- --port 3101 > release-evidence/server.log 2>&1 &
+          printf '%s\n' "$!" > release-evidence/server.pid
+          for i in $(seq 1 60); do
+            if curl --silent --fail http://localhost:3101/ > /dev/null; then exit 0; fi
+            sleep 2
+          done
+          cat release-evidence/server.log
+          exit 1
+
+      - name: Check excluded routes on built server
+        if: ${{ !cancelled() && steps.server.outcome == 'success' }}
+        id: routes
+        run: |
+          set +e
+          python3 - <<'PY' > release-evidence/excluded-routes.log 2>&1
+          from urllib.error import HTTPError
+          from urllib.request import urlopen
+          for route in ('/heic-to-jpg', '/heic-to-png', '/share', '/share/manage'):
+              try:
+                  response = urlopen('http://localhost:3101' + route)
+              except HTTPError as error:
+                  response = error
+              body = response.read().decode('utf-8', 'replace').lower()
+              assert response.status == 404, f'{route}: HTTP {response.status}'
+              assert 'noindex' in body, f'{route}: no noindex signal'
+              print(f'PASS: {route} returned 404 and noindex')
+          PY
+          code=$?
+          printf '%s\n' "$code" > release-evidence/excluded-routes.exit
+          cat release-evidence/excluded-routes.log
+          exit "$code"
+
+      - name: Essential Chromium workflows
+        if: ${{ !cancelled() && steps.routes.outcome == 'success' }}
+        id: chromium
+        run: |
+          touch release-evidence/browser-tests-started
+          set +e
+          PLAYWRIGHT_JSON_OUTPUT_FILE="$PWD/release-evidence/chromium.json" npx playwright test --config=playwright.quality.config.ts --project=chromium --workers=1 --reporter=list,json \
+            src/tests/e2e/workspace.spec.ts \
+            src/tests/e2e/workspace-production-quality.spec.ts \
+            src/tests/e2e/editor-production.spec.ts \
+            src/tests/e2e/encode-production.spec.ts \
+            src/tests/e2e/safe-share.spec.ts \
+            src/tests/e2e/safe-share-verification.spec.ts \
+            src/tests/e2e/privacy-guard-production.spec.ts \
+            src/tests/e2e/v23-privacy.spec.ts \
+            src/tests/e2e/ocr-production.spec.ts \
+            src/tests/e2e/searchable-pdf-production.spec.ts \
+            src/tests/e2e/pdf-production.spec.ts > release-evidence/chromium.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/chromium.exit
+          cat release-evidence/chromium.log
+          exit "$code"
+
+      - name: Essential WebKit workflows
+        if: ${{ !cancelled() && steps.routes.outcome == 'success' }}
+        id: webkit
+        run: |
+          touch release-evidence/browser-tests-started
+          set +e
+          PLAYWRIGHT_JSON_OUTPUT_FILE="$PWD/release-evidence/webkit.json" npx playwright test --config=playwright.quality.config.ts --project=webkit --workers=1 --reporter=list,json \
+            src/tests/e2e/workspace.spec.ts \
+            src/tests/e2e/safe-share.spec.ts \
+            src/tests/e2e/safe-share-verification.spec.ts \
+            src/tests/e2e/privacy-guard-production.spec.ts \
+            src/tests/e2e/v23-privacy.spec.ts \
+            src/tests/e2e/ocr-production.spec.ts \
+            src/tests/e2e/searchable-pdf-production.spec.ts > release-evidence/webkit.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/webkit.exit
+          cat release-evidence/webkit.log
+          exit "$code"
+
+      - name: Stop server and inspect browser shutdown
+        if: always()
+        run: |
+          mkdir -p release-evidence
+          if [ -f release-evidence/server.pid ]; then
+            server_pid="$(cat release-evidence/server.pid)"
+            if kill -0 "$server_pid" 2>/dev/null; then
+              kill -- "-$server_pid" 2>/dev/null || true
+              printf 'Stopped server process group %s\n' "$server_pid" > release-evidence/server-stop.log
+            fi
+          fi
+          sleep 3
+          python3 - <<'PY' > release-evidence/browser-cleanup.log 2>&1
+          from pathlib import Path
+          if not Path('release-evidence/browser-tests-started').exists():
+              print('NOT CHECKED: browser suites did not start')
+          else:
+              names = {'chrome', 'chromium', 'headless_shell', 'MiniBrowser'}
+              found = []
+              for comm in Path('/proc').glob('[0-9]*/comm'):
+                  try:
+                      name = comm.read_text().strip()
+                  except (FileNotFoundError, PermissionError):
+                      continue
+                  if name in names or name.startswith('WebKit') or name.startswith('chrome-headless'):
+                      found.append((comm.parent.name, name))
+              print(f'Browser processes after Playwright exit: {found}')
+              assert not found, 'Native browser processes remain'
+          PY
+          code=$?
+          printf '%s\n' "$code" > release-evidence/browser-cleanup.exit
+          cat release-evidence/browser-cleanup.log
+          exit "$code"
+
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: shotexa-release-verification
+          path: |
+            release-evidence/
+            test-results/quality-audit/
+          if-no-files-found: warn
+          retention-days: 7

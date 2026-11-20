@@ -13,21 +13,24 @@ import type { ImageDims, StaticBands, StitchPlan } from "./types";
 export function planStitch(a: ImageDims, b: ImageDims, offsetY: number, bands: StaticBands): StitchPlan {
   const dy = Math.round(Math.min(Math.max(offsetY, 1), a.height));
   const lo = dy + bands.top;
-  const hi = a.height - bands.bottom;
+  const hi = Math.min(a.height - bands.bottom, dy + b.height);
   let seam = Math.round((lo + hi) / 2);
-  seam = Math.min(a.height, Math.max(dy, seam));
+  const bottomB = dy + b.height;
+  seam = Math.min(a.height, bottomB, Math.max(dy, seam));
 
   const bStart = seam - dy;
   const bHeight = b.height - bStart;
   return {
     width: Math.max(a.width, b.width),
-    height: seam + bHeight,
+    height: Math.max(a.height, bottomB),
     offsetY: dy,
     seamY: seam,
     segments: [
-      { source: "a", sy: 0, height: seam, dy: 0 },
-      { source: "b", sy: bStart, height: bHeight, dy: seam },
-    ],
+      { source: "a" as const, sy: 0, height: seam, dy: 0 },
+      { source: "b" as const, sy: bStart, height: bHeight, dy: seam },
+      // A shorter, contained B must not crop away the rest of A.
+      ...(bottomB < a.height ? [{ source: "a" as const, sy: bottomB, height: a.height - bottomB, dy: bottomB }] : []),
+    ].filter(s => s.height > 0),
   };
 }
 

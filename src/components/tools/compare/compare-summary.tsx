@@ -152,6 +152,7 @@ export function CompareSummaryPanel({
             <p className="t-body-sm mt-3 text-ink-3">
               {summary.metric.mode === "perceptual" ? "Perceptual" : "Pixel"} metric · {summary.metric.description}
             </p>
+            {summary.warnings.map(warning => <p key={warning} className="t-body-sm mt-2 text-ink-2">{warning}</p>)}
             {summary.alignment.status !== "off" && (
               <p className="t-mono mt-2 text-[12px] text-ink-2" data-testid="compare-summary-alignment">
                 Alignment: X {summary.alignment.x >= 0 ? "+" : ""}

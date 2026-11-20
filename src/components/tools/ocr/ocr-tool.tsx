@@ -11,6 +11,7 @@ import { useWorkspace, useWorkspaceContext } from "@/components/workspace/worksp
 import { WorkspaceShell } from "@/components/workspace/workspace-shell";
 import { continuationsFor } from "@/config/tools";
 import { downloadOcrText } from "@/core/ocr/text-export";
+import { hasOcrText } from "@/core/ocr/normalize";
 import { messageFor } from "@/core/runtime/messages";
 import type { OcrLanguageChoice } from "@/core/runtime/types";
 
@@ -18,7 +19,10 @@ function stageLabel(stage?: string): string {
   if (!stage) return "Preparing local OCR";
   const value = stage.toLowerCase();
   if (value.includes("load") || value.includes("initial")) return "Loading language model";
-  if (value.includes("recogn")) return "Reading text";
+  if (value.includes("recogn") || value.includes("reading")) {
+    const section = stage.match(/section \d+ of \d+/i)?.[0];
+    return section ? `Reading text · ${section}` : "Reading text";
+  }
   if (value.includes("prepar") || value.includes("encod")) return "Preparing screenshot";
   return "Processing locally";
 }
@@ -53,8 +57,12 @@ function OcrWorkspace() {
   if (!selectedId || !file) return null;
 
   const busy = result?.status === "running";
-  const ready = result?.status === "done" && !!result.resultId;
+  const processed = result?.status === "done" && !!result.resultId;
   const text = result?.editedText ?? "";
+  const ready = processed && text.trim().length > 0;
+  const noText = processed && !text.trim();
+  const languageChanged = processed && result.language !== language;
+  const searchable = hasOcrText(runtime.ocrResults.forAsset(selectedId)) && !languageChanged;
 
   async function extract() {
     try {
@@ -77,8 +85,8 @@ function OcrWorkspace() {
     <WorkspaceShell
       tool="extract-text"
       status={
-        <Badge tone={ready ? "success" : result?.status === "failed" ? "error" : busy ? "accent" : "neutral"} dot>
-          {ready ? "Text ready" : busy ? stageLabel(result?.stage) : result?.status === "failed" ? "Extraction failed" : "Ready to extract"}
+        <Badge tone={ready ? "success" : noText ? "warning" : result?.status === "failed" ? "error" : busy ? "accent" : "neutral"} dot>
+          {ready ? "Text ready" : noText ? "No text found" : busy ? stageLabel(result?.stage) : result?.status === "failed" ? "Extraction failed" : "Ready to extract"}
         </Badge>
       }
       fileHint="OCR reads the currently selected screenshot. Previous Shotexa results stay available here."
@@ -106,6 +114,8 @@ function OcrWorkspace() {
               Your screenshot is unchanged. Start again whenever you are ready.
             </Notice>
           )}
+          {noText && <Notice className="mb-4" tone="warning" title="No readable text was found" data-testid="ocr-empty">Try another language or a clearer copy. You can still enter text manually for Copy/TXT; manual text has no OCR geometry for a searchable PDF.</Notice>}
+          {languageChanged && <Notice className="mb-4" tone="warning" title="Language selection changed" data-testid="ocr-language-changed">The displayed result uses the previous language selection. Extract again to apply the selected language.</Notice>}
           <div className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-line bg-surface px-4 py-3 shadow-xs">
             <div>
               <p className="font-display text-lg">Screenshot to Text</p>
@@ -143,7 +153,7 @@ function OcrWorkspace() {
                   </Button>
                 </div>
               </div>
-              {ready || text ? (
+              {processed || text ? (
                 <textarea
                   aria-label="Extracted text"
                   data-testid="ocr-result-text"
@@ -216,11 +226,11 @@ function OcrWorkspace() {
             <div className="mt-5 rounded-lg border border-[#cfe5d6] bg-success-soft p-4 text-sm font-medium text-success">
               Text is ready. Your edits are saved in this browser workspace until refresh.
             </div>
-            <div className="mt-6 rounded-lg border border-accent-line bg-accent-soft p-4">
+            {searchable && <div className="mt-6 rounded-lg border border-accent-line bg-accent-soft p-4">
               <p className="font-display text-lg">Searchable PDF is ready to use this result</p>
               <p className="mt-1 text-sm text-ink-2">The original OCR layout and word geometry stay attached to this screenshot. Your edited text remains the Copy/TXT version.</p>
-            </div>
-            <ContinueWith tools={continuationsFor("extract-text")} fileId={selectedId} />
+            </div>}
+            <ContinueWith tools={continuationsFor("extract-text").filter((tool) => tool !== "searchable-pdf" || searchable)} fileId={selectedId} />
           </div>
         )
       }

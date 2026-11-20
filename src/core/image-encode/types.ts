@@ -18,6 +18,8 @@ export interface EncodeSettings {
   background: string;
   /** Requested byte budget for lossy Compress output, or null for manual quality. */
   targetBytes: number | null;
+  /** Explicit user choice; omitted by existing workflows means original dimensions. */
+  resizePercent?: number;
 }
 
 export interface EncodeOptions {
@@ -29,6 +31,7 @@ export interface EncodeOptions {
   probe?: { format: OutputFormat; quality: number };
   /** Bounded JPEG/WebP search target. PNG never accepts a made-up quality target. */
   targetBytes?: number | null;
+  resizePercent?: number;
   createCanvas?: (width: number, height: number) => OffscreenCanvas | HTMLCanvasElement;
   yieldBetweenTiles?: () => Promise<void>;
   signal?: { readonly aborted: boolean };

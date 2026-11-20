@@ -13,6 +13,8 @@ import type { EncodeRunResult } from "@/core/runtime/runtime";
 import { cn } from "@/lib/cn";
 import { useElementWidth } from "@/lib/use-element-width";
 import { useObjectUrls } from "@/lib/object-url";
+import { CompressorComparison } from "./compressor-comparison";
+import { encodeSize, suggestResizePercent } from "@/core/image-encode/geometry";
 
 const MAX_PANE = 520;
 
@@ -26,6 +28,8 @@ export function EncodePreview({
   blocked,
   onRun,
   onApply,
+  tool = "convert",
+  onResize,
 }: {
   assetId: string;
   format: OutputFormat;
@@ -35,6 +39,8 @@ export function EncodePreview({
   blocked: boolean;
   onRun(): void;
   onApply(s: NonNullable<Suggestion["apply"]>): void;
+  tool?: "compress" | "convert";
+  onResize?(percent: number): void;
 }) {
   const file = useWorkspace((s) => s.files[assetId]);
   const [measureRef, available] = useElementWidth<HTMLDivElement>();
@@ -47,7 +53,9 @@ export function EncodePreview({
 
   return (
     <section aria-label="Before and after" data-testid="encode-workspace">
-      <div ref={measureRef} className="grid grid-cols-2 gap-2 sm:gap-4">
+      {tool === "compress" && <div className="mb-3 flex flex-wrap justify-between gap-2 text-xs text-ink-3"><span data-testid="encode-original-meta">{FORMAT_LABEL[input]} · {file.width} × {file.height} · {formatBytes(file.bytes)}</span><span data-testid="encode-result-meta">{result ? `${FORMAT_LABEL[result.format]}${supportsQuality(result.format) ? ` at ${Math.round(result.quality * 100)}% quality` : " lossless"} · ${result.width} × ${result.height} · ${formatBytes(result.bytes)}` : "Check file size to measure the result"}</span></div>}
+      <div ref={measureRef}>
+      {tool === "compress" ? <CompressorComparison file={file} result={result} paneWidth={paneWidth} stale={stale} placeholder={<div className="flex min-h-40 flex-col items-center justify-center gap-3 p-3 text-center"><p className="text-sm text-ink-2">Measure size, then inspect text at 100%.</p><Button onClick={onRun} disabled={busy || blocked} className="min-h-11"><Gauge /> Check file size</Button></div>} /> : <div className="grid grid-cols-2 gap-2 sm:gap-4">
         <figure className="min-w-0 rounded-lg border border-line bg-surface p-2 shadow-xs sm:p-3">
           <figcaption className="mb-2 flex flex-wrap items-baseline justify-between gap-x-2 text-sm">
             <span className="font-medium">Original</span>
@@ -88,15 +96,18 @@ export function EncodePreview({
             )}
           </div>
         </figure>
+      </div>}
       </div>
-      {result && <Comparison result={result} stale={stale} busy={busy} blocked={blocked} onRun={onRun} onApply={onApply} />}
+      {result && <Comparison result={result} stale={stale} busy={busy} blocked={blocked} onRun={onRun} onApply={onApply} source={file} onResize={onResize} />}
     </section>
   );
 }
 
-function Comparison({ result, stale, busy, blocked, onRun, onApply }: { result: EncodeRunResult; stale: boolean; busy: boolean; blocked: boolean; onRun(): void; onApply(s: NonNullable<Suggestion["apply"]>): void }) {
+function Comparison({ result, stale, busy, blocked, onRun, onApply, source, onResize }: { result: EncodeRunResult; stale: boolean; busy: boolean; blocked: boolean; onRun(): void; onApply(s: NonNullable<Suggestion["apply"]>): void; source: { width: number; height: number }; onResize?(percent: number): void }) {
   const c = compareSize(result.originalBytes, result.bytes);
   const hint = stale ? null : suggest({ format: result.format, quality: result.quality, comparison: c, probe: result.probe });
+  const suggestedPercent = result.target && !result.target.metTarget ? suggestResizePercent(result.resizePercent ?? 100, result.bytes, result.target.bytes) : null;
+  const suggestedSize = suggestedPercent === null ? null : encodeSize(source, suggestedPercent);
   return (
     <div
       className={cn("mt-4 rounded-lg border p-4", stale ? "border-line bg-surface-3" : c.outcome === "larger" ? "border-[#f0dcb4] bg-warning-soft" : "border-[#cfe5d6] bg-success-soft")}
@@ -124,6 +135,7 @@ function Comparison({ result, stale, busy, blocked, onRun, onApply }: { result: 
           </dd>
         </div>
       </dl>
+      <p className="mt-2 text-xs text-ink-3">Exact output: {result.bytes.toLocaleString()} bytes{stale ? " · previous settings" : ""}.</p>
       {stale ? (
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
           <p className="t-body-sm text-ink-2">Settings changed since this result.</p>
@@ -134,12 +146,13 @@ function Comparison({ result, stale, busy, blocked, onRun, onApply }: { result: 
       ) : (
         <>
           {result.target && (
-            <p className={cn("t-body-sm mt-3", result.target.metTarget ? "text-success" : "text-warning")} data-testid="encode-target-result">
+            <p className={cn("t-body-sm mt-3", result.target.metTarget ? "text-success" : "text-warning")} data-testid="encode-target-result" data-target-met={result.target.metTarget}>
               {result.target.metTarget
                 ? `Target ${formatBytes(result.target.bytes)} met at ${Math.round(result.quality * 100)}% quality after ${result.target.attempts} ${result.target.attempts === 1 ? "try" : "tries"}.`
-                : `The target ${formatBytes(result.target.bytes)} could not be reached at 50% quality without resizing or changing format. This is the smallest measured result.`}
+                : `The target ${formatBytes(result.target.bytes)} could not be reached within 50–${Math.round((result.requestedQuality ?? result.quality) * 100)}% quality at ${result.width} × ${result.height}. This is the smallest measured result (${result.bytes.toLocaleString()} bytes).`}
             </p>
           )}
+          {suggestedSize && suggestedPercent !== null && onResize && <div className="mt-3 rounded-md border border-line bg-surface p-3"><p className="text-sm text-ink-2">Smaller dimensions can reduce size but also remove text detail. This suggestion needs a new measurement; the target is not guaranteed.</p><Button className="mt-2 min-h-11" variant="secondary" disabled={busy} onClick={() => onResize(suggestedPercent)} data-testid="compressor-resize-suggestion">Resize to {suggestedSize.width} × {suggestedSize.height} and check</Button></div>}
           {c.outcome === "larger" && (
             <p className="t-body-sm mt-3 text-ink" data-testid="encode-larger">
               This result is <strong>larger</strong> than the original — keeping the original is smaller.

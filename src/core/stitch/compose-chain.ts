@@ -47,6 +47,7 @@ async function encode(c: AnyCanvas, format: OutputFormat, quality?: number): Pro
 }
 
 export async function composeChain(images: Blob[], plan: ComposePlan, o: ComposeChainOptions): Promise<ComposeChainResult> {
+  if (o.signal?.aborted) throw new StitchError("CANCELLED");
   const t0 = performance.now();
   const limits = o.limits ?? DEFAULT_LIMITS;
   const make = o.createCanvas ?? ((w: number, h: number) => new OffscreenCanvas(w, h));
@@ -65,6 +66,7 @@ export async function composeChain(images: Blob[], plan: ComposePlan, o: Compose
     const ctx = canvas.getContext("2d") as OffscreenCanvasRenderingContext2D | CanvasRenderingContext2D | null;
     if (!ctx) throw new RangeError("canvas allocation failed");
     try {
+      const lastUse = new Map(plan.segments.map((seg, i) => [seg.source, i]));
       if (o.format === "jpeg") {
         ctx.fillStyle = "#fff";
         ctx.fillRect(0, 0, plan.width, plan.height);
@@ -73,10 +75,12 @@ export async function composeChain(images: Blob[], plan: ComposePlan, o: Compose
         if (o.signal?.aborted) throw new StitchError("CANCELLED");
         const bm = await provider.get(seg.source);
         ctx.drawImage(bm, 0, seg.sy, bm.width, seg.height, 0, seg.dy, bm.width, seg.height);
+        if (lastUse.get(seg.source) === i) provider.release(seg.source);
         o.onProgress?.((i + 1) / (plan.segments.length + 1));
         await o.yieldBetweenTiles?.();
       }
       blob = await encode(canvas, o.format, o.quality);
+      if (o.signal?.aborted) throw new StitchError("CANCELLED");
     } finally {
       for (const seg of plan.segments) provider.release(seg.source);
       canvas.width = 0; // a canvas that drew bitmaps pins them until reset (Spike B)
@@ -97,6 +101,7 @@ export async function composeChain(images: Blob[], plan: ComposePlan, o: Compose
         },
       });
       blob = await encoder.finish();
+      if (o.signal?.aborted) throw new StitchError("CANCELLED");
     } catch (e) {
       encoder.abort();
       if ((e as Error).message === "CANCELLED") throw new StitchError("CANCELLED");

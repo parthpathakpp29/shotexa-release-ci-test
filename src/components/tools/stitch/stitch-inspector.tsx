@@ -97,6 +97,12 @@ export function StitchInspector({
             </FieldLabel>
             <Slider id={sliderId} label="Join position" min={1} max={max} value={pair?.offset ?? 1} valueText={pair ? `${pair.offset} pixels` : undefined} onChange={(v) => setOffset(v, true)} className={cn(!ready && "opacity-50")} />
             <p className="t-body-sm mt-1.5 text-ink-3">Where screenshot {join + 2} starts inside screenshot {join + 1}.</p>
+            {pair?.matchScore !== undefined && <div className="t-body-sm mt-2 space-y-1 text-ink-2" data-testid="stitch-match-evidence">
+              <p>Automatic match score: {Math.round(pair.matchScore * 100)}%. This is a heuristic, not a guarantee.</p>
+              <p>{pair.offset !== pair.autoOffset ? "This join was adjusted manually and has not been reverified." : pair.matched ? "Check text and repeated elements at the seam before exporting." : "No reliable overlap was accepted. This pair is kept end to end until you adjust the join."}</p>
+              {pair.matchNotes?.map(note => <p key={note}>{note === "low-similarity" ? "The images do not share a strong visual match." : note === "seam-ink-mismatch" ? "Text or edges disagree at the proposed join." : note === "low-residual-contrast" ? "Several positions look similar; repeated elements may be ambiguous." : note}</p>)}
+            </div>}
+            <Button variant="ghost" size="sm" className="mt-2" disabled={!ready} onClick={() => setOffset(max)}>Place this pair end to end</Button>
           </div>
 
           <Button variant="secondary" className="w-full" aria-expanded={manualMode} onClick={() => setManualMode(!manualMode)} disabled={!ready}>

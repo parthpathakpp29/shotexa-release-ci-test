@@ -8,6 +8,7 @@ export type PdfErrorCode =
   | "PDF_UNSUPPORTED_SIZE"
   | "PDF_INVALID_BREAKS"
   | "PDF_OCR_REQUIRED"
+  | "PDF_OCR_EMPTY"
   | "PDF_FONT_LOAD_FAILED";
 
 export class PdfError extends Error {
