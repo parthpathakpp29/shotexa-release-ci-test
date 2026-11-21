@@ -65,7 +65,7 @@ jobs:
               records.append({'path': name, 'bytes': len(data), 'sha256': content_hash})
               digest.update((name + '\0' + content_hash + '\n').encode())
           actual = digest.hexdigest()
-          expected = '37420a23523f492e0ab1ea2077a96cdc4a46b70bcb8bbd4fbe965a8540f38d9b'
+          expected = '116b8f7f7999256bf40beeed3132bdf31b11b2599ea3078c1649702d4573ae63'
           assert actual == expected, f'Candidate manifest digest mismatch: {actual}'
           Path('release-evidence').mkdir(exist_ok=True)
           Path('release-evidence/candidate-hashes.json').write_text(json.dumps(records, indent=2) + '\n')
@@ -73,7 +73,7 @@ jobs:
           PY
           mkdir -p release-evidence
           git rev-parse HEAD > release-evidence/test-commit.txt
-          printf '1125 files; manifest digest 37420a23523f492e0ab1ea2077a96cdc4a46b70bcb8bbd4fbe965a8540f38d9b\n' > release-evidence/integrity.txt
+          printf '1125 files; manifest digest 116b8f7f7999256bf40beeed3132bdf31b11b2599ea3078c1649702d4573ae63\n' > release-evidence/integrity.txt
 
       - name: Check runner capacity
         run: |

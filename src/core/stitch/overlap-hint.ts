@@ -176,6 +176,6 @@ function matchTemplate(A: Float32Array, a: GrayImage, B: Float32Array, b: GrayIm
   const gap = best.s - second;
   const likely = (best.s >= HINT.strongScore && gap >= HINT.minStrongGap)
     || (best.s >= HINT.minScore && gap >= HINT.minGap)
-    || (best.s >= HINT.distinctScore && gap >= HINT.distinctGap);
+    || (!sameAsIdentity && best.s >= HINT.distinctScore && gap >= HINT.distinctGap);
   return { likely, score: best.s, gap, reason: likely ? "match" : "no-match" };
 }
