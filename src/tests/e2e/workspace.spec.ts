@@ -12,6 +12,7 @@ import { expect, test, type Download, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { FIXTURE_DIR } from "../helpers/stitch-fixtures";
+import { likelyOverlap } from "../../core/stitch/overlap-hint";
 
 const A = join(FIXTURE_DIR, "chat-light/a.png");
 const B = join(FIXTURE_DIR, "chat-light/b.png");
@@ -58,6 +59,32 @@ test.describe("Phase 1 workspace", () => {
   test.use({ viewport: { width: 1440, height: 960 } });
 
   test("homepage upload → overlap suggestion → Smart Stitch → export", async ({ page }) => {
+    await page.addInitScript(() => {
+      type Probe = { width: number; height: number; data: number[] };
+      const holder = window as Window & { __overlapProbes?: Probe[] };
+      holder.__overlapProbes = [];
+      const capture = (image: ImageData) => {
+        if (image.width !== 128 || image.height <= 100) return;
+        const gray = new Uint8Array(image.width * image.height);
+        for (let i = 0, p = 0; i < gray.length; i++, p += 4)
+          gray[i] = (image.data[p] * 77 + image.data[p + 1] * 150 + image.data[p + 2] * 29) >> 8;
+        holder.__overlapProbes?.push({ width: image.width, height: image.height, data: Array.from(gray) });
+      };
+      const original = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function (this: CanvasRenderingContext2D, ...args: Parameters<typeof original>) {
+        const image = original.apply(this, args);
+        capture(image);
+        return image;
+      };
+      if (typeof OffscreenCanvasRenderingContext2D !== "undefined") {
+        const offscreenOriginal = OffscreenCanvasRenderingContext2D.prototype.getImageData;
+        OffscreenCanvasRenderingContext2D.prototype.getImageData = function (this: OffscreenCanvasRenderingContext2D, ...args: Parameters<typeof offscreenOriginal>) {
+          const image = offscreenOriginal.apply(this, args);
+          capture(image);
+          return image;
+        };
+      }
+    });
     const leaks: string[] = [];
     const errors: string[] = [];
     page.on("console", (m) => {
@@ -81,7 +108,21 @@ test.describe("Phase 1 workspace", () => {
     await page.getByTestId("file-input").setInputFiles([A, B]);
     await expect(page.getByTestId("connected-workspace")).toBeVisible();
     await expect(page.getByTestId("file-item")).toHaveCount(2);
-    await expect(page.getByText("These screenshots appear to overlap.")).toBeVisible({ timeout: 30_000 });
+    try {
+      await expect(page.getByText("These screenshots appear to overlap.")).toBeVisible({ timeout: 30_000 });
+    } finally {
+      const probes = await page.evaluate(() => (window as Window & { __overlapProbes?: { width: number; height: number; data: number[] }[] }).__overlapProbes ?? []);
+      const pair = probes.length >= 2 ? likelyOverlap(
+        { ...probes[probes.length - 2], data: Uint8Array.from(probes[probes.length - 2].data) },
+        { ...probes[probes.length - 1], data: Uint8Array.from(probes[probes.length - 1].data) },
+      ) : null;
+      console.log("WEBKIT_OVERLAP_PROBE", JSON.stringify({
+        previews: await page.getByText(/Preparing preview|Preview unavailable|Preview stopped/).allTextContents(),
+        status: await page.getByText(/Checking for overlap|Ready to stitch/).allTextContents(),
+        proxyDimensions: probes.map(({ width, height }) => ({ width, height })),
+        detector: pair,
+      }));
+    }
     await shot(page, "02-connected-workspace");
 
     await page.getByRole("link", { name: "Smart Stitch" }).first().click();

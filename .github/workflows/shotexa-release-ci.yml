@@ -24,6 +24,7 @@ jobs:
           python3 - <<'PY'
           import base64
           import hashlib
+          import json
           from pathlib import Path
           excluded = {'.github/workflows/shotexa-release-ci.yml'}
           files = sorted((p for p in Path('.').rglob('*') if p.is_file()
@@ -40,6 +41,7 @@ jobs:
           }
           assert len(crlf_bits) == (len(files) + 7) // 8
           digest = hashlib.sha256()
+          records = []
           for index, path in enumerate(files):
               name = path.as_posix()
               data = path.read_bytes()
@@ -60,15 +62,18 @@ jobs:
                   data = bytes(rebuilt)
                   path.write_bytes(data)
               content_hash = hashlib.sha256(data).hexdigest()
+              records.append({'path': name, 'bytes': len(data), 'sha256': content_hash})
               digest.update((name + '\0' + content_hash + '\n').encode())
           actual = digest.hexdigest()
-          expected = '131cbabd3c91a825fdf420e99ae37a51c1b5bf35100f8b6428421d7b9e87958d'
+          expected = '2a0da8f2149531bab307ee476b1b98d37e16351dc2e82815b37bc3d05c33652b'
           assert actual == expected, f'Candidate manifest digest mismatch: {actual}'
+          Path('release-evidence').mkdir(exist_ok=True)
+          Path('release-evidence/candidate-hashes.json').write_text(json.dumps(records, indent=2) + '\n')
           print(f'PASS: {len(files)} candidate files; manifest digest {actual}')
           PY
           mkdir -p release-evidence
           git rev-parse HEAD > release-evidence/test-commit.txt
-          printf '1125 files; manifest digest 131cbabd3c91a825fdf420e99ae37a51c1b5bf35100f8b6428421d7b9e87958d\n' > release-evidence/integrity.txt
+          printf '1125 files; manifest digest 2a0da8f2149531bab307ee476b1b98d37e16351dc2e82815b37bc3d05c33652b\n' > release-evidence/integrity.txt
 
       - name: Check runner capacity
         run: |
@@ -232,8 +237,22 @@ jobs:
           cat release-evidence/excluded-routes.log
           exit "$code"
 
-      - name: Essential Chromium workflows
+      - name: Focused WebKit regressions
         if: ${{ !cancelled() && steps.routes.outcome == 'success' }}
+        id: focused
+        run: |
+          touch release-evidence/browser-tests-started
+          set +e
+          PLAYWRIGHT_JSON_OUTPUT_FILE="$PWD/release-evidence/focused-webkit.json" npx playwright test --config=playwright.quality.config.ts --project=webkit --workers=1 --reporter=list,json \
+            --grep 'local face suggestion|homepage upload' \
+            src/tests/e2e/v23-privacy.spec.ts src/tests/e2e/workspace.spec.ts > release-evidence/focused-webkit.log 2>&1
+          code=$?
+          printf '%s\n' "$code" > release-evidence/focused-webkit.exit
+          cat release-evidence/focused-webkit.log
+          exit "$code"
+
+      - name: Essential Chromium workflows
+        if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
         id: chromium
         run: |
           touch release-evidence/browser-tests-started
@@ -256,7 +275,7 @@ jobs:
           exit "$code"
 
       - name: Essential WebKit workflows
-        if: ${{ !cancelled() && steps.routes.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.focused.outcome == 'success' }}
         id: webkit
         run: |
           touch release-evidence/browser-tests-started
