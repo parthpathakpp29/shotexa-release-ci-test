@@ -65,7 +65,7 @@ jobs:
               records.append({'path': name, 'bytes': len(data), 'sha256': content_hash})
               digest.update((name + '\0' + content_hash + '\n').encode())
           actual = digest.hexdigest()
-          expected = '2a0da8f2149531bab307ee476b1b98d37e16351dc2e82815b37bc3d05c33652b'
+          expected = '37420a23523f492e0ab1ea2077a96cdc4a46b70bcb8bbd4fbe965a8540f38d9b'
           assert actual == expected, f'Candidate manifest digest mismatch: {actual}'
           Path('release-evidence').mkdir(exist_ok=True)
           Path('release-evidence/candidate-hashes.json').write_text(json.dumps(records, indent=2) + '\n')
@@ -73,7 +73,7 @@ jobs:
           PY
           mkdir -p release-evidence
           git rev-parse HEAD > release-evidence/test-commit.txt
-          printf '1125 files; manifest digest 2a0da8f2149531bab307ee476b1b98d37e16351dc2e82815b37bc3d05c33652b\n' > release-evidence/integrity.txt
+          printf '1125 files; manifest digest 37420a23523f492e0ab1ea2077a96cdc4a46b70bcb8bbd4fbe965a8540f38d9b\n' > release-evidence/integrity.txt
 
       - name: Check runner capacity
         run: |
@@ -292,6 +292,42 @@ jobs:
           printf '%s\n' "$code" > release-evidence/webkit.exit
           cat release-evidence/webkit.log
           exit "$code"
+
+      - name: Remaining Chromium regressions
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' && steps.webkit.outcome == 'success' }}
+        id: remaining_chromium
+        run: |
+          set +e
+          mapfile -t specs < <(find src/tests/e2e -maxdepth 1 -name '*.spec.ts' | sort | grep -Ev '/(workspace|workspace-production-quality|editor-production|encode-production|safe-share|safe-share-verification|privacy-guard-production|v23-privacy|ocr-production|searchable-pdf-production|pdf-production)\.spec\.ts$')
+          if [ "${#specs[@]}" -ne 41 ]; then echo "Unexpected remaining spec count: ${#specs[@]}"; exit 1; fi
+          overall=0
+          for shard in 1 2 3 4; do
+            PLAYWRIGHT_JSON_OUTPUT_FILE="$PWD/release-evidence/remaining-chromium-${shard}.json" npx playwright test --config=playwright.quality.config.ts --project=chromium --workers=1 --reporter=list,json --shard="$shard/4" "${specs[@]}" > "release-evidence/remaining-chromium-${shard}.log" 2>&1
+            code=$?
+            printf '%s\n' "$code" > "release-evidence/remaining-chromium-${shard}.exit"
+            cat "release-evidence/remaining-chromium-${shard}.log"
+            if [ "$code" -ne 0 ]; then overall=1; fi
+          done
+          printf '%s\n' "$overall" > release-evidence/remaining-chromium.exit
+          exit "$overall"
+
+      - name: Remaining WebKit regressions
+        if: ${{ !cancelled() && steps.chromium.outcome == 'success' && steps.webkit.outcome == 'success' }}
+        id: remaining_webkit
+        run: |
+          set +e
+          mapfile -t specs < <(find src/tests/e2e -maxdepth 1 -name '*.spec.ts' | sort | grep -Ev '/(workspace|workspace-production-quality|editor-production|encode-production|safe-share|safe-share-verification|privacy-guard-production|v23-privacy|ocr-production|searchable-pdf-production|pdf-production)\.spec\.ts$')
+          if [ "${#specs[@]}" -ne 41 ]; then echo "Unexpected remaining spec count: ${#specs[@]}"; exit 1; fi
+          overall=0
+          for shard in 1 2 3 4; do
+            PLAYWRIGHT_JSON_OUTPUT_FILE="$PWD/release-evidence/remaining-webkit-${shard}.json" npx playwright test --config=playwright.quality.config.ts --project=webkit --workers=1 --reporter=list,json --shard="$shard/4" "${specs[@]}" > "release-evidence/remaining-webkit-${shard}.log" 2>&1
+            code=$?
+            printf '%s\n' "$code" > "release-evidence/remaining-webkit-${shard}.exit"
+            cat "release-evidence/remaining-webkit-${shard}.log"
+            if [ "$code" -ne 0 ]; then overall=1; fi
+          done
+          printf '%s\n' "$overall" > release-evidence/remaining-webkit.exit
+          exit "$overall"
 
       - name: Stop server and inspect browser shutdown
         if: always()

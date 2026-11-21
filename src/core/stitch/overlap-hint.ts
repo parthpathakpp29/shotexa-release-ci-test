@@ -45,6 +45,9 @@ export const HINT = {
   minScore: 0.9,
   /** …and beat everything outside ±peakWindow rows by this much (or be near-perfect). */
   minGap: 0.08,
+  /** Browser preview resampling may lower NCC while leaving a unique, unambiguous peak. */
+  distinctScore: 0.82,
+  distinctGap: 0.3,
   strongScore: 0.975,
   /** Even a near-perfect peak must not be tied with another position (repetitive content). */
   minStrongGap: 0.015,
@@ -171,6 +174,8 @@ function matchTemplate(A: Float32Array, a: GrayImage, B: Float32Array, b: GrayIm
   const window = Math.max(2, Math.round(th * HINT.peakWindowFrac));
   const second = scores.reduce((m, x) => (Math.abs(x.y - best.y) > window && x.s > m ? x.s : m), -1);
   const gap = best.s - second;
-  const likely = (best.s >= HINT.strongScore && gap >= HINT.minStrongGap) || (best.s >= HINT.minScore && gap >= HINT.minGap);
+  const likely = (best.s >= HINT.strongScore && gap >= HINT.minStrongGap)
+    || (best.s >= HINT.minScore && gap >= HINT.minGap)
+    || (best.s >= HINT.distinctScore && gap >= HINT.distinctGap);
   return { likely, score: best.s, gap, reason: likely ? "match" : "no-match" };
 }
